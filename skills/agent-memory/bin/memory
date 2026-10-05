@@ -14,6 +14,23 @@ INDEX_TEMP_FILES=()
 DREAM_STOPWORDS='the and for with that this from are was not use uses used when into only via per its has have all any but can must should does never always'
 export DREAM_STOPWORDS
 
+# `${#var}` counts characters only in a UTF-8 locale. launchd and cron start
+# without LANG, so bash would count bytes and a 76-character Cyrillic
+# description would look 136 long. Pick a UTF-8 LC_CTYPE when there is none.
+use_utf8_ctype() {
+  local cur="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" have l nl=$'\n'
+  case "$cur" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) return 0 ;; esac
+  have="$nl$(locale -a 2>/dev/null || true)$nl"
+  for l in C.UTF-8 en_US.UTF-8 C.utf8 en_US.utf8; do
+    case "$have" in
+      *"$nl$l$nl"*)
+        if [ -n "${LC_ALL:-}" ]; then export LC_ALL="$l"; else export LC_CTYPE="$l"; fi
+        return 0 ;;
+    esac
+  done
+}
+use_utf8_ctype
+
 # Make a relative store location independent of later directory changes.  The
 # store itself is canonicalized by init before it is used as a link target.
 MEMORY_HOME="${AGENT_MEMORY_HOME:-$HOME/.agent-memory}"

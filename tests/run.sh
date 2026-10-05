@@ -1998,6 +1998,26 @@ test_dream_incremental_is_per_workspace() {
   assert_contains "$out" "- home/workspace/other-ws.md"
 }
 
+test_description_length_counts_characters_without_locale() {
+  dream_fixture
+  # 76 characters, 136 bytes: under launchd (no LANG) bash used to count bytes.
+  dfact "$DP1" cyrillic gotcha "Падающий ARK HAL-плагин может скрыть все аудиоустройства, включая встроенные" 2026-09-30
+  dream_reindex
+  local env_args=(HOME="$HOME" PATH="$PATH" AGENT_MEMORY_HOME="$AGENT_MEMORY_HOME" AGENT_MEMORY_TODAY="$AGENT_MEMORY_TODAY")
+  local setting out
+  for setting in "" "LANG=C" "LC_ALL=C" "LC_ALL=POSIX"; do
+    out="$(env -i "${env_args[@]}" ${setting:+"$setting"} "$MEMORY" dream --report)"
+    assert_not_contains "$out" "long description"
+    out="$(cd "$PROJ" && env -i "${env_args[@]}" ${setting:+"$setting"} "$MEMORY" doctor)"
+    assert_not_contains "$out" "LONG DESCRIPTION"
+  done
+  # A really long one is still reported, with its length in characters.
+  dfact "$DP1" cyrillic gotcha "$(printf 'щ%.0s' $(seq 1 121))" 2026-09-30
+  dream_reindex
+  out="$(env -i "${env_args[@]}" "$MEMORY" dream --report)"
+  assert_contains "$out" "long description (121 chars)"
+}
+
 test_dream_rejects_full_with_report() {
   dream_fixture
   local out rc=0
