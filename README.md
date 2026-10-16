@@ -26,7 +26,7 @@ Codex and other AGENTS.md readers, install the 20-line snippet from
 Install the skill, then install its native OpenCode V2 plugin once:
 
 ```bash
-npx skills add kurbezz/memory -g -a opencode
+npx skills add dot-opencode/memory -g -a opencode
 ~/.agents/skills/agent-memory/bin/memory install-opencode
 ```
 
