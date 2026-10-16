@@ -45,6 +45,26 @@ Use `memory` from PATH, or the bundled `agent-memory/bin/memory`.
 
 ## Unattended alternative
 
-`memory dream` (no flags) does the same for the whole store, unattended, in a
-sandboxed OpenCode run, and commits before and after (never pushes). See the
-README for the sandbox details.
+Suggest `memory dream` to the user for whole-store unattended cleanup; do not
+launch it autonomously, since it can take time and incur model costs. Unlike the
+interactive procedure above, it cannot delete or rename facts. It can update or
+create a retained fact for a merge or move, then recommends manual deletion of
+the old path. Only ordinary fact Markdown is editable; the CLI rebuilds indexes.
+Grep/glob and Git add/mv/rm are disabled; MCP/plugin integrations are denied by
+policy. Only exact `git -C <dir> status` and `git -C <dir> status --short` commands
+are allowed for the store or a known project directory, with no extra arguments.
+Unlike the interactive procedure, unattended verification reads current files
+only; facts requiring Git history remain unresolved for manual review.
+History/content commands are disabled because they bypass file-read restrictions.
+Web access is denied by default (`--web` opts in).
+`--timeout <minutes>` defaults to 120 or
+`AGENT_MEMORY_DREAM_TIMEOUT`. Project config loading is disabled. Permissions are
+application-level best effort, not OS isolation, and cannot guarantee
+confidentiality from the model/provider. Any change other than a fact in an
+existing level directory fails the run as a review commit.
+
+Pending changes are committed separately before the run; nothing is pushed.
+Failed or timed-out runs commit any changes as
+`memory: dream FAILED (exit N) — review` without advancing the last-successful-run
+ref. Review the result before reverting its commit (`HEAD` only if it is still
+the result commit). See the README for permission details and undo instructions.

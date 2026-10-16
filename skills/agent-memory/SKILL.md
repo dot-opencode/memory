@@ -32,6 +32,32 @@ structured message derived from the staged diff (e.g.
 per-scope body) — nothing to configure, it just describes what changed.
 Reading and writing facts is always plain file I/O, no CLI needed.
 
+Suggest unattended `memory dream` to the user rather than launching it
+autonomously: it can take time and incur model costs. It edits ordinary fact
+Markdown and recommends manual deletions; it cannot delete or rename facts.
+For merges or moves it can update or create the retained fact, leaving the old
+path for manual deletion. The CLI rebuilds indexes. Grep/glob and Git add/mv/rm
+are disabled, and MCP/plugin integrations are denied by policy.
+The only Git shell commands allowed are exactly `git -C <dir> status` and
+`git -C <dir> status --short` for the store or a known project directory, without
+extra arguments. Verification reads current files only; facts requiring Git
+history remain unresolved for manual review because history/content commands
+bypass file-read restrictions and are disabled.
+Web access is denied by default (`--web` opts in). `--timeout <minutes>` sets a
+positive whole number of minutes, defaulting to 120 or
+`AGENT_MEMORY_DREAM_TIMEOUT`. Project config loading
+is disabled for the run. Its permissions are application-level best effort, not
+OS isolation, and cannot guarantee confidentiality from the model/provider.
+The CLI also refuses a store with symlinks and fails the run (as a review
+commit) on any change other than a fact in an existing level directory; see the
+README for details.
+
+Pending changes are backed up separately before the run. Failed or timed-out
+runs commit any changes as `memory: dream FAILED (exit N) — review` without
+advancing the last-successful-run ref. Review the result commit before reverting
+it; use `revert HEAD` only if that result is still HEAD. See the README for
+review and undo instructions.
+
 The CLI requires Bash, `git`, `grep`, `awk`, `readlink`, and filesystem
 symlink support; it has no server, database, or package-runtime dependency.
 

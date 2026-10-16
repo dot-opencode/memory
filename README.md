@@ -82,50 +82,98 @@ The store location defaults to `~/.agent-memory` and can be overridden with
 ## Dream
 
 Memory rots: facts get duplicated, contradict each other or go stale. Dream
-consolidates the store — merge duplicates, resolve contradictions, verify and
-prune stale facts, move facts shared by several projects up to a group or the
-workspace.
+helps consolidate the store: correct facts, resolve contradictions, combine
+shared details and identify facts to remove.
 
 - `memory dream --report [--stale-days N] [--workspace <ws>]` — read-only
   report over the whole store (works from any directory, writes nothing).
-- `memory dream [--workspace <ws>] [--model <provider/model>]` — an unattended
-  OpenCode agent works through the report and fixes the store.
+- `memory dream [--workspace <ws>] [--model <provider/model>] [--web] [--timeout <minutes>]` — an unattended
+  OpenCode agent works through the report and edits ordinary fact Markdown.
+  It can update or create a retained fact for a merge or move, but cannot delete
+  or rename the old file: it reports paths for manual deletion instead. The CLI
+  rebuilds indexes afterwards.
   `--print-config` shows the exact config and prompt without running anything.
-  `--if-changed` skips the run when nothing was committed to the store since
+  `--if-changed` skips the run when no fact changed since
   the last successful run, for use from a nightly scheduler (launchd, cron).
   After the first successful run, later runs are incremental: the agent gets
   the list of facts added or changed since the last run and checks only those
   against the rest (more than 150 changed facts means a full run). `--full`
   forces a full pass over the store.
+  Web access is denied by default; `--web` enables it for checking references.
+  `--timeout` sets a positive whole number of minutes (default 120, or
+  `AGENT_MEMORY_DREAM_TIMEOUT`); the CLI stops the run when the limit expires.
   Without `--model` it uses `AGENT_MEMORY_DREAM_MODEL`, or OpenCode's default
   model. The consolidation is judgment work, so a strong model is worth it: in
   testing, a small model read 35 of 500 facts and changed only descriptions.
-- The `memory-dream` skill does the same interactively for the current project,
-  asking for approval before deleting, merging or moving facts.
+- The local `memory-dream` skill works interactively on the current project's
+  memory. Unlike the unattended CLI run, it may delete or move facts after
+  asking for approval.
 
-The unattended run is sandboxed. The agent can read anywhere except secret
-paths (`~/.ssh`, `~/.aws`, `.env` files, ...), write only inside the store
-(never `.git`), and run only `memory dream --report`, read-only git commands
-(`log`, `show`, `diff`, `status`, `rev-list`, `ls-tree`, `blame`) and
-`git add/mv/rm` in the store (the only way it can delete or move a fact). There is no
-`cat`/`rg` in the shell: file reading goes through OpenCode's own read tools,
-where the secret-path rules apply. Web access is allowed for checking references,
-and the only subagent is a read-only checker. The boundary is enforced through
-OpenCode `experimental.policies`, which a project's `opencode.json` cannot
-override. It runs `opencode run --standalone` from the store directory with the
-config passed in `OPENCODE_CONFIG_CONTENT`, so your OpenCode config files are
-not modified. The run uses its own OpenCode database at
+The unattended run uses best-effort application-level permissions, not OS
+isolation. The intended scope is reading the store and known project directories,
+editing ordinary fact Markdown and a read-only checker subagent. The only Git
+shell commands allowed are exactly `git -C <dir> status` and
+`git -C <dir> status --short` for the store or a known project directory, with no
+extra arguments. Verification uses current files through the read tool; facts
+requiring Git history remain unresolved for manual review. History and content
+commands are disabled because they bypass file-read restrictions.
+Grep and glob tools are disabled because their permission
+resources are search expressions rather than paths. Git add/mv/rm are disabled
+because wildcard permissions cannot safely constrain their arguments. MCP and
+plugin integrations are denied by policy. These restrictions cannot guarantee
+confidentiality from the model or its provider. Do not run it on data you are not
+willing to send to that provider.
+The rules were verified with live runs on OpenCode v2.0.31; enforcement may
+differ in other versions.
+
+The permission matcher cannot express everything, so the CLI adds its own
+checks. It refuses to run if the store contains symlinks outside `.git`. After
+the run, any change other than a `<slug>.md` fact in a level directory that
+already existed (a new project or group directory, a nested, hidden or
+non-Markdown file, a delete or rename) fails the run as a review commit. If
+`sqlite3` is available, it reads the run's session database and fails the run
+when no tool call succeeded or `memory dream --report` was denied, so a broken
+sandbox is not counted as a quiet night; without `sqlite3` it only warns.
+
+It runs `opencode run --standalone` from the store directory with the config
+passed in `OPENCODE_CONFIG_CONTENT` and project config loading disabled, so your
+OpenCode config files are not modified. The run uses its own OpenCode database at
 `<store>/.git/memory-dream.db`, which holds the latest run only, so dream
-sessions never show up in OpenCode's session list. Your global config and
-plugins still load, and the sandbox config is merged on top of them.
+sessions are kept separate from the usual OpenCode session list. The permission
+config is merged with global config; this is not an isolated OpenCode installation.
 `memory dream --print-config` shows the exact rules.
 
-The store is committed before the run (if it has pending changes) and after it;
-nothing is ever pushed. To undo a run:
+Pending store changes are committed before the run, separately from its result;
+nothing is pushed. A successful run commits its changes and advances the local
+last-successful-run ref. On failure or timeout, any changes are committed as
+`memory: dream FAILED (exit N) — review`, without advancing that ref. If there
+are no changes, there is no result commit.
+
+Dream and backup share a writer lock. An external `memory backup` waits up to
+10 seconds by default; if still busy, it exits 75 and explicitly reports that
+the request was **not saved**. Retry after the writer finishes. Stale or uncertain
+locks also require manual recovery and return nonzero; they never expire
+automatically. Before removing a lock, stop **all** memory writers and inspect
+the owner metadata, verifying both PID and process start time; missing metadata
+does not prove a lock is stale. Follow the CLI's recovery guidance, not a blind
+lock deletion.
+
+If final indexing or saving fails even after the agent exits successfully, a
+FAILED review marker is retained. Fix the git/index error and run
+`memory backup` to save remaining changes as a FAILED review commit. Service Git
+operations intentionally disable hooks and commit signing so unattended saves
+do not invoke user hooks or signing prompts.
+
+Review the store's git log and diff before undoing a result. If its commit is
+still `HEAD`, use this (replace the path if you use `AGENT_MEMORY_HOME`):
 
 ```bash
 git -C ~/.agent-memory revert HEAD
 ```
+
+Otherwise revert the result's commit hash instead of `HEAD`. This leaves the
+separate pre-run backup intact; reverting does not reset the last-successful-run
+ref. Use `memory dream --full` if the next run should reconsider all facts.
 
 ## Other agents
 
