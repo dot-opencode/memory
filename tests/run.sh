@@ -12,6 +12,7 @@ setup() {
   export AGENT_MEMORY_HOME="$TMP/store"
   export HOME="$TMP/home"                 # isolates global git config too
   unset XDG_CONFIG_HOME                   # CI runners set it; config must follow $HOME
+  export AGENT_MEMORY_BACKUP_LOCK_WAIT=0
   unset AGENT_MEMORY_DREAM_MODEL          # a user's shell default must not leak into the dream tests
   export GIT_CONFIG_NOSYSTEM=1
   mkdir -p "$HOME"
@@ -1631,7 +1632,6 @@ fi
 git status --porcelain --untracked-files=all > "$STUB_LOG/status-at-run"
 git log --oneline | wc -l | tr -d ' ' > "$STUB_LOG/commits-at-run"
 if [ -n "${STUB_EDIT:-}" ]; then
-  rm -f work/projects/some-api/stale-fact.md
   printf -- '---\ndescription: merged replacement\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' \
     > work/projects/some-api/merged-fact.md
 fi
@@ -1660,10 +1660,10 @@ test_dream_print_config_renders_without_launching() {
   out="$(PATH="/usr/bin:/bin" "$MEMORY" dream --print-config)"
   assert_not_contains "$out" "__"
   assert_contains "$out" "$store"
-  assert_contains "$out" "experimental"
+  assert_contains "$out" '"policies"'
   assert_contains "$out" "memory-dream-check"
   assert_contains "$out" "$HOME/.ssh/*"
-  assert_contains "$out" "$store/.git/*"
+  assert_contains "$out" 'edit:*/.git/*'
   assert_contains "$out" "$ROOT/skills/agent-memory/bin/memory dream --report"
   assert_contains "$out" "---"
   assert_not_contains "$out" "Workspace scope:"
@@ -1680,7 +1680,7 @@ test_dream_print_config_is_valid_json() {
   printf '%s' "$json" | node -e '
     const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
     if (c.default_agent !== "memory-dream") throw new Error("default_agent");
-    if (!Array.isArray(c.experimental.policies) || c.experimental.policies[0].effect !== "deny") throw new Error("policies");
+    if (!Array.isArray(c.policies) || c.policies[0].effect !== "deny") throw new Error("policies");
     if (c.agents["memory-dream"].mode !== "primary") throw new Error("primary");
     if (c.agents["memory-dream-check"].mode !== "subagent") throw new Error("subagent");
     const check = c.agents["memory-dream-check"].permissions;
@@ -1850,7 +1850,7 @@ install_backup_calling_stub() {
 printf -- '---\ndescription: mid-run edit\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' \
   > work/projects/some-api/mid-run.md
 "$MEMORY_BIN" backup > "$STUB_LOG/backup-out" 2>&1
-[ -f .git/memory-dream.lock ] && echo held > "$STUB_LOG/lock"
+[ -d .git/memory-dream.lock ] && echo held > "$STUB_LOG/lock"
 printf '%s\n' "$@" > "$STUB_LOG/args"
 exit "${STUB_EXIT:-0}"
 EOF
@@ -1863,7 +1863,7 @@ test_dream_run_holds_lock_so_other_backups_wait() {
   local base
   base="$(commit_count)"
   MEMORY_BIN="$MEMORY" "$MEMORY" dream >/dev/null
-  assert_contains "$(<"$STUB_LOG/backup-out")" "'memory dream' is running"
+  assert_contains "$(<"$STUB_LOG/backup-out")" "request NOT saved"
   assert_eq "$(<"$STUB_LOG/lock")" "held"
   # One commit for the whole run, holding the mid-run edit; the lock is gone.
   assert_eq "$(commit_count)" "$((base + 1))"
@@ -1874,18 +1874,22 @@ test_dream_run_holds_lock_so_other_backups_wait() {
   assert_contains "$("$MEMORY" backup)" "backed up"
 }
 
-test_dream_run_releases_lock_on_failure_and_ignores_stale_lock() {
-  dream_launch_fixture
-  STUB_EXIT=1 "$MEMORY" dream >/dev/null 2>&1 || true
-  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left after a failed run"
-  # A lock left by a dead process blocks neither backup nor dream.
-  printf '999999\n' > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
-  dfact "$DP1" some-fact convention "a convention" 2026-09-30
-  assert_contains "$("$MEMORY" backup)" "backed up"
-  printf '999999\n' > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
-  rm -f "$STUB_LOG/args"
-  "$MEMORY" dream >/dev/null
-  assert_file "$STUB_LOG/args"
+test_dream_uncertain_and_stale_locks_require_manual_recovery() {
+  dream_template_fixture
+  local lock="$AGENT_MEMORY_HOME/.git/memory-dream.lock" out rc=0
+  mkdir "$lock"
+  out="$("$TMEM" backup 2>&1)" && fail "busy backup reported success"
+  assert_contains "$out" "request NOT saved"
+  out="$("$TMEM" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "manual recovery"
+  [ -d "$lock" ] || fail "unpublished lock removed"
+  printf '999999\nold start\n' > "$lock/owner"
+  out="$("$TMEM" backup 2>&1)" && fail "busy backup reported success"
+  assert_contains "$out" "request NOT saved"
+  [ -f "$lock/owner" ] || fail "stale metadata removed automatically"
+  rm "$lock/owner"; rmdir "$lock"
+  "$TMEM" dream >/dev/null
 }
 
 test_dream_run_refuses_a_second_concurrent_run() {
@@ -1897,7 +1901,7 @@ test_dream_run_refuses_a_second_concurrent_run() {
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
   assert_eq "$rc" 1
-  assert_contains "$out" "already running on this store (pid $live)"
+  assert_contains "$out" "already running on this store (pid $live"
   [ ! -e "$STUB_LOG/args" ] || fail "second run launched opencode"
 }
 
@@ -1908,11 +1912,11 @@ test_dream_run_rebuilds_indexes_and_commits() {
   out="$(STUB_EDIT=1 "$MEMORY" dream)"
   assert_eq "$(commit_count)" "$((base + 1))"
   assert_contains "$(<"$DP1/INDEX.md")" "[merged-fact](merged-fact.md) — decision: merged replacement"
-  assert_not_contains "$(<"$DP1/INDEX.md")" "stale-fact"
+  # The agent cannot delete: the obsolete fact stays for manual removal.
+  assert_contains "$(<"$DP1/INDEX.md")" "stale-fact"
   assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
   assert_contains "$out" "dream: changes since"
   assert_contains "$out" "merged-fact.md"
-  assert_contains "$out" "stale-fact.md"
   "$MEMORY" doctor >/dev/null
   [ -z "$(git -C "$AGENT_MEMORY_HOME" remote)" ] || fail "store unexpectedly has a remote"
 }
@@ -1926,27 +1930,299 @@ test_dream_run_without_changes_reports_none() {
   assert_contains "$out" "dream: no changes"
 }
 
-test_dream_run_failure_leaves_changes_uncommitted() {
+test_dream_run_failure_commits_separately_and_keeps_marker() {
   dream_launch_fixture
-  local head out rc=0
+  "$MEMORY" dream >/dev/null
+  local marker head out rc=0
+  marker="$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)"
   head="$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
-  out="$(STUB_EDIT=1 STUB_EXIT=1 "$MEMORY" dream 2>&1)" || rc=$?
+  out="$(STUB_EDIT=1 STUB_EXIT=3 "$MEMORY" dream 2>&1)" || rc=$?
   assert_eq "$rc" 1
-  assert_contains "$out" "opencode run failed (exit 1)"
-  assert_contains "$out" "left uncommitted"
-  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)" "$head"
-  [ -n "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ] || fail "failed run left no changes to review"
-  assert_not_contains "$(<"$DP1/INDEX.md")" "merged-fact"
+  assert_contains "$out" "opencode run failed (exit 3)"
+  assert_contains "$out" "revert HEAD"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "memory: dream FAILED (exit 3) — review"
+  [ "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)" != "$head" ] || fail "failed run was not committed"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$marker"
+  assert_contains "$(<"$DP1/INDEX.md")" "merged-fact"
+  git -C "$AGENT_MEMORY_HOME" revert --no-edit HEAD >/dev/null
+  [ -f "$DP1/stale-fact.md" ] || fail "revert lost a pre-existing fact"
+  [ ! -e "$DP1/merged-fact.md" ] || fail "revert did not undo the failed run"
 }
 
-test_dream_prompt_explains_deletion_and_git_commands() {
+test_dream_run_times_out_and_commits_failure() {
+  dream_launch_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: partial\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/partial.md
+printf -- '---\ndescription: interrupted edit\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/interrupted.md
+echo $$ > "$STUB_LOG/pid"
+exec sleep 60
+EOF
+  chmod +x "$TMP/bin/opencode"
+  local out rc=0 pid
+  out="$(AGENT_MEMORY_DREAM_TIMEOUT_SECS=1 AGENT_MEMORY_DREAM_KILL_GRACE=1 "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "timed out"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "dream FAILED"
+  pid="$(<"$STUB_LOG/pid")"
+  ! kill -0 "$pid" 2>/dev/null || fail "opencode still running after timeout"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left after timeout"
+}
+
+test_dream_timeout_flag_and_env_validation() {
+  dream_launch_fixture
+  local out rc=0
+  out="$("$MEMORY" dream --timeout abc 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "usage: memory dream"
+  rc=0; out="$(AGENT_MEMORY_DREAM_TIMEOUT=x "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "invalid dream timeout"
+  "$MEMORY" dream --timeout 5 >/dev/null
+  assert_file "$STUB_LOG/args"
+}
+
+test_dream_signal_kills_child_and_releases_lock() {
+  dream_template_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: interrupted edit\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/interrupted.md
+echo $$ > "$STUB_LOG/pid"
+exec sleep 60
+EOF
+  chmod +x "$TMP/bin/opencode"
+  AGENT_MEMORY_DREAM_KILL_GRACE=1 "$TMEM" dream >"$STUB_LOG/dream-out" 2>&1 &
+  local dpid=$! i=0 cpid
+  while [ ! -s "$STUB_LOG/pid" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+  if [ ! -s "$STUB_LOG/pid" ]; then
+    kill -TERM "$dpid" 2>/dev/null || true
+    wait "$dpid" 2>/dev/null || true
+    fail "opencode did not become ready: $(<"$STUB_LOG/dream-out")"
+  fi
+  cpid="$(<"$STUB_LOG/pid")"
+  kill -TERM "$dpid"
+  wait "$dpid" 2>/dev/null || true
+  ! kill -0 "$cpid" 2>/dev/null || fail "child survived SIGTERM of dream"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left after SIGTERM"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "dream FAILED"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+}
+
+test_dream_lock_is_taken_before_pending_backup() {
+  dream_launch_fixture
+  sleep 30 &
+  local live=$! head out rc=0
+  head="$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+  dfact "$DP1" pending-fact convention "pending" 2026-09-30
+  printf '%s\n%s\n%s\n' "$live" "$(ps -o lstart= -p "$live" | sed 's/^ *//; s/ *$//')" "$(date +%s)" \
+    > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
+  out="$("$MEMORY" dream --if-changed 2>&1)" || rc=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  assert_eq "$rc" 1
+  assert_contains "$out" "already running"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)" "$head"
+}
+
+test_dream_live_writer_never_expires_by_age() {
+  dream_template_fixture
+  local lock="$AGENT_MEMORY_HOME/.git/memory-dream.lock" out rc=0
+  mkdir "$lock"
+  printf '%s\n%s\n1\n' "$$" "$(ps -o lstart= -p "$$" | sed 's/^ *//; s/ *$//')" > "$lock/owner"
+  out="$("$TMEM" dream --timeout 480 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  [ -f "$lock/owner" ] || fail "live old lock removed"
+  rm "$lock/owner"; rmdir "$lock"
+}
+
+test_backup_ignores_user_hooks_and_nothing_to_back_up_in_empty_store() {
+  mkdir "$TMP/empty-store"
+  git init -q "$TMP/empty-store"
+  git config --global user.useConfigOnly true
+  git config --global --unset user.email
+  assert_eq "$(AGENT_MEMORY_HOME="$TMP/empty-store" "$MEMORY" backup)" "nothing to back up"
+  git config --global user.email "test@example.com"
+  "$MEMORY" init work >/dev/null
+  mkdir -p "$AGENT_MEMORY_HOME/.git/hooks"
+  printf '#!/bin/sh\nexit 1\n' > "$AGENT_MEMORY_HOME/.git/hooks/pre-commit"
+  chmod +x "$AGENT_MEMORY_HOME/.git/hooks/pre-commit"
+  write_fact .memory/project a-fact context "something learned"
+  assert_contains "$("$MEMORY" backup)" "backed up"
+}
+
+test_backup_retries_while_index_lock_exists() {
+  "$MEMORY" init work >/dev/null
+  write_fact .memory/project a-fact context "something learned"
+  : > "$AGENT_MEMORY_HOME/.git/index.lock"
+  ( sleep 2; rm -f "$AGENT_MEMORY_HOME/.git/index.lock" ) &
+  assert_contains "$("$MEMORY" backup)" "backed up"
+  wait
+}
+
+test_backup_push_refuses_detached_head() {
+  "$MEMORY" init work >/dev/null
+  write_fact .memory/project a-fact context "something learned"
+  "$MEMORY" backup >/dev/null
+  git init -q --bare "$TMP/remote.git"
+  git -C "$AGENT_MEMORY_HOME" remote add origin "$TMP/remote.git"
+  git -C "$AGENT_MEMORY_HOME" checkout -q --detach
+  local out rc=0
+  out="$("$MEMORY" backup --push 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "detached HEAD"
+  git -C "$AGENT_MEMORY_HOME" checkout -q main
+  "$MEMORY" backup --push >/dev/null
+  git -C "$TMP/remote.git" rev-parse -q --verify main >/dev/null || fail "push did not reach the remote"
+}
+
+test_dream_if_changed_workspace_scope() {
+  dream_launch_fixture
+  "$MEMORY" dream --workspace work >/dev/null
+  mkdir -p "$AGENT_MEMORY_HOME/home/workspace"
+  dfact "$AGENT_MEMORY_HOME/home/workspace" other-ws convention "another workspace" 2026-09-30
+  rm -f "$STUB_LOG/args"
+  local out
+  out="$("$MEMORY" dream --if-changed --workspace work)"
+  assert_contains "$out" "skipping"
+  [ ! -e "$STUB_LOG/args" ] || fail "a change in another workspace triggered the run"
+}
+
+test_init_rejects_project_link_from_other_workspace() {
+  "$MEMORY" init work >/dev/null
+  rm .memory/workspace
+  local out rc=0
+  out="$("$MEMORY" init other 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "outside workspace 'other'"
+}
+
+test_doctor_reports_workspace_mismatch() {
+  "$MEMORY" init work >/dev/null
+  mkdir -p "$AGENT_MEMORY_HOME/other/workspace"
+  : > "$AGENT_MEMORY_HOME/other/workspace/INDEX.md"
+  ln -sfn "$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)/other/workspace" .memory/workspace
+  local out rc=0
+  out="$("$MEMORY" doctor 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "WORKSPACE MISMATCH"
+}
+
+test_dangling_link_check_survives_invalid_utf8() {
+  "$MEMORY" init work >/dev/null
+  write_fact .memory/project a-fact context "something learned"
+  printf 'bad \377\376 bytes [[missing-one]]\n' >> .memory/project/a-fact.md
+  assert_contains "$("$MEMORY" doctor 2>&1)" "DANGLING WIKI LINK: .memory/project/a-fact.md -> [[missing-one]]"
+  assert_contains "$("$MEMORY" dream --report 2>&1)" "dangling link"
+}
+
+test_symlinked_facts_are_skipped() {
+  "$MEMORY" init work >/dev/null
+  write_fact .memory/project real-fact context "a real one"
+  printf -- '---\ndescription: outside\ntype: context\ncreated: 2026-09-04\n---\nx\n' > "$TMP/outside.md"
+  ln -s "$TMP/outside.md" .memory/project/linked-fact.md
+  "$MEMORY" index >/dev/null 2>&1
+  assert_not_contains "$(<.memory/project/INDEX.md)" "linked-fact"
+  assert_contains "$(<.memory/project/INDEX.md)" "real-fact"
+  assert_contains "$("$MEMORY" dream --report 2>&1)" "symlinked fact ignored"
+}
+
+test_init_excludes_scratch_files_from_store_git() {
+  "$MEMORY" init work >/dev/null
+  "$MEMORY" init work >/dev/null
+  local ex="$AGENT_MEMORY_HOME/.git/info/exclude"
+  grep -qxF '.memory-index.*' "$ex" || fail "index temp pattern missing"
+  ! grep -qxF 'memory-dream.*' "$ex" || fail "broad dream pattern retained"
+  assert_eq "$(grep -cxF '.memory-index.*' "$ex")" 1
+  : > .memory/project/.memory-index.AbCdEf
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain --untracked-files=all | grep -c memory-index || true)" 0
+}
+
+test_stale_index_temp_files_are_removed_on_publish() {
+  "$MEMORY" init work >/dev/null
+  : > .memory/project/.memory-index.old123
+  touch -t 202001010000 .memory/project/.memory-index.old123
+  "$MEMORY" index >/dev/null
+  [ ! -e .memory/project/.memory-index.old123 ] || fail "stale temp file kept"
+}
+
+test_home_unset_gives_clear_error() {
+  local out rc=0
+  out="$(env -u HOME -u AGENT_MEMORY_HOME "$MEMORY" status 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "HOME is not set"
+}
+
+dream_template_fixture() {
+  dream_launch_fixture
+  cp -R "$ROOT/skills/agent-memory" "$TMP/skill"
+  cat > "$TMP/skill/dream/opencode.json" <<'EOF'
+{
+  "store": "__STORE__",
+  "dirs": [
+    "__PROJECT_DIR__",
+  ],
+  "web": "x", "_tag": "__WEB_ONLY__"
+  "end": 1
+}
+EOF
+  TMEM="$TMP/skill/bin/memory"
+}
+
+test_dream_template_project_dir_and_web_tokens() {
+  dream_template_fixture
+  local out
+  out="$("$TMEM" dream --print-config)"
+  assert_not_contains "$out" "__PROJECT_DIR__"
+  assert_not_contains "$out" "__WEB_ONLY__"
+  assert_contains "$out" "\"$(cd -P "$PROJ" && pwd -P)\","
+  assert_contains "$out" "\"$(cd -P "$TMP/code/other-api" && pwd -P)\","
+  assert_not_contains "$out" "_tag"
+  out="$("$TMEM" dream --print-config --web)"
+  assert_contains "$out" '"_tag": ""'
+  assert_not_contains "$out" "__WEB_ONLY__"
+  # Missing directories are skipped; a workspace scope limits the list.
+  rm -r "$TMP/code/other-api"
+  out="$("$TMEM" dream --print-config)"
+  assert_not_contains "$out" "other-api"
+  mkdir -p "$AGENT_MEMORY_HOME/home/projects/p"
+  mkdir -p "$TMP/code/home-proj"
+  printf '%s\n' "$TMP/code/home-proj" > "$AGENT_MEMORY_HOME/home/projects/p/.project-path"
+  out="$("$TMEM" dream --print-config --workspace work)"
+  assert_not_contains "$out" "home-proj"
+  out="$("$TMEM" dream --print-config --workspace home)"
+  assert_contains "$out" "home-proj"
+  assert_not_contains "$out" "some-api"
+}
+
+test_dream_template_without_project_dirs_deletes_line() {
+  dream_template_fixture
+  rm -r "$TMP/code/other-api"
+  cd "$TMP"
+  rm -r "$PROJ"
+  local out
+  out="$("$TMEM" dream --print-config)"
+  assert_not_contains "$out" "__PROJECT_DIR__"
+  assert_contains "$out" '"dirs": ['
+}
+
+test_dream_run_disables_project_config() {
+  dream_launch_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf '%s %s\n' "${OPENCODE_CONFIG_PROJECT_DISABLE:-}" "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" > "$STUB_LOG/env"
+EOF
+  chmod +x "$TMP/bin/opencode"
+  "$MEMORY" dream >/dev/null
+  assert_eq "$(<"$STUB_LOG/env")" "1 1"
+}
+
+test_dream_prompt_explains_restricted_git_commands() {
   dream_fixture
-  local out store
-  store="$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)"
+  local out
   out="$("$MEMORY" dream --print-config)"
-  assert_contains "$out" "only with \`git -C $store rm <path>\`"
-  assert_contains "$out" "\`rev-list\`"
-  assert_contains "$out" "There is no \`git grep\`"
+  assert_contains "$out" 'Git history and content-reading commands are disabled'
+  assert_contains "$out" 'git -C <dir> status --short'
 }
 
 test_dream_first_run_is_full_then_incremental() {
@@ -2024,6 +2300,498 @@ test_dream_rejects_full_with_report() {
   out="$("$MEMORY" dream --report --full 2>&1)" || rc=$?
   assert_eq "$rc" 1
   assert_contains "$out" "usage: memory dream"
+}
+
+test_init_migrates_broad_exclude_and_keeps_legitimate_fact() {
+  "$MEMORY" init work >/dev/null
+  printf 'memory-dream.*\nkeep-me\n' >> "$AGENT_MEMORY_HOME/.git/info/exclude"
+  "$MEMORY" init work >/dev/null
+  ! grep -qxF 'memory-dream.*' "$AGENT_MEMORY_HOME/.git/info/exclude" || fail "broad exclude kept"
+  grep -qxF 'keep-me' "$AGENT_MEMORY_HOME/.git/info/exclude" || fail "unrelated exclude removed"
+  write_fact .memory/project memory-dream context "legitimate fact"
+  "$MEMORY" backup >/dev/null
+  git -C "$AGENT_MEMORY_HOME" ls-files --error-unmatch work/projects/some-api/memory-dream.md >/dev/null
+}
+
+test_init_rejects_new_symlink_destinations_before_writes() {
+  "$MEMORY" init work >/dev/null
+  mkdir "$TMP/outside"
+  ln -s "$TMP/outside" "$AGENT_MEMORY_HOME/escape"
+  mkdir "$TMP/code/new"
+  local out rc=0
+  out="$(cd "$TMP/code/new" && "$MEMORY" init escape 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_eq "$(ls -A "$TMP/outside")" ""
+  ln -s "$TMP/outside" "$AGENT_MEMORY_HOME/work/projects/evil"
+  rc=0; out="$(cd "$TMP/code/new" && "$MEMORY" init work --name evil 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  ln -s "$TMP/outside" "$AGENT_MEMORY_HOME/work/groups/evil"
+  rc=0; out="$("$MEMORY" link-group evil 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_eq "$(ls -A "$TMP/outside")" ""
+}
+
+test_init_rejects_symlink_metadata_and_index() {
+  "$MEMORY" init work >/dev/null
+  printf 'unchanged\n' > "$TMP/outside"
+  rm .memory/project/.project-path
+  ln -s "$TMP/outside" .memory/project/.project-path
+  local rc=0
+  "$MEMORY" init work >/dev/null 2>&1 || rc=$?
+  assert_eq "$rc" 1
+  assert_eq "$(<"$TMP/outside")" unchanged
+  rm .memory/project/.project-path
+  rm .memory/workspace/INDEX.md
+  ln -s "$TMP/outside" .memory/workspace/INDEX.md
+  rc=0; "$MEMORY" init work >/dev/null 2>&1 || rc=$?
+  assert_eq "$rc" 1
+  assert_eq "$(<"$TMP/outside")" unchanged
+}
+
+test_init_mismatch_has_no_new_workspace_side_effect() {
+  "$MEMORY" init work >/dev/null
+  rm .memory/workspace
+  "$MEMORY" init other >/dev/null 2>&1 || true
+  [ ! -e "$AGENT_MEMORY_HOME/other" ] || fail "mismatch created workspace"
+}
+
+test_dream_template_literal_paths_and_controls() {
+  dream_template_fixture
+  local literal="$TMP/code/__HOME__-__STORE__" out
+  mkdir "$literal"
+  printf '%s\n' "$literal" > "$DP1/.project-path"
+  out="$("$TMEM" dream --print-config)"
+  assert_contains "$out" "$literal"
+  mkdir "$TMP/code/"$'tab\tpath'
+  printf '%s\n' "$TMP/code/"$'tab\tpath' > "$DP1/.project-path"
+  out="$("$TMEM" dream --print-config)"
+  assert_not_contains "$out" $'tab\tpath'
+  mkdir "$TMP/code/"$'cr\rpath'
+  ln -s "$TMP/code/"$'cr\rpath' "$TMP/code/safe-name"
+  printf '%s\n' "$TMP/code/safe-name" > "$DP1/.project-path"
+  out="$("$TMEM" dream --print-config)"
+  assert_not_contains "$out" $'cr\rpath'
+}
+
+test_failed_dream_commit_failure_survives_next_backup() {
+  dream_template_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: failed partial\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/partial.md
+git config user.useConfigOnly true
+git config --global --unset user.email
+git config --global user.useConfigOnly true
+exit 7
+EOF
+  chmod +x "$TMP/bin/opencode"
+  local out rc=0
+  out="$("$TMEM" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "could not be created"
+  assert_not_contains "$out" "no changes to review"
+  assert_file "$AGENT_MEMORY_HOME/.git/memory-dream.failed"
+  git -C "$AGENT_MEMORY_HOME" config user.email test@example.com
+  out="$("$TMEM" backup)"
+  assert_contains "$out" "FAILED review"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "memory: dream FAILED (exit 7) — review"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.failed" ] || fail "marker retained after commit"
+}
+
+test_backups_share_atomic_writer_lock() {
+  dream_template_fixture
+  local realgit
+  realgit="$(command -v git)"
+  export REAL_GIT="$realgit"
+  cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = add ] && [ ! -f "$STUB_LOG/release" ]; then
+    : > "$STUB_LOG/adding"
+    while [ ! -f "$STUB_LOG/release" ]; do sleep 0.1; done
+  fi
+done
+exec "$REAL_GIT" "$@"
+EOF
+  chmod +x "$TMP/bin/git"
+  dfact "$DP1" pending decision "pending" 2026-09-04
+  "$TMEM" backup > "$STUB_LOG/first" 2>&1 &
+  local writer=$! i=0 out rc=0
+  while [ ! -f "$STUB_LOG/adding" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+  assert_file "$STUB_LOG/adding"
+  out="$("$TMEM" backup 2>&1)" && fail "busy backup reported success"
+  assert_contains "$out" "request NOT saved"
+  out="$("$TMEM" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  : > "$STUB_LOG/release"
+  wait "$writer"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+}
+
+test_dream_success_marker_updated_under_writer_lock() {
+  dream_template_fixture
+  REAL_GIT="$(command -v git)"
+  export REAL_GIT
+  cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = update-ref ]; then
+    if [ -d "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ]; then
+      echo held > "$STUB_LOG/ref-lock"
+    else
+      echo released > "$STUB_LOG/ref-lock"
+    fi
+  fi
+done
+exec "$REAL_GIT" "$@"
+EOF
+  chmod +x "$TMP/bin/git"
+  "$TMEM" dream >/dev/null
+  assert_eq "$(<"$STUB_LOG/ref-lock")" held
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+}
+
+test_timeout_kills_stubborn_grandchildren() {
+  dream_template_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+bash -c 'trap "" TERM; bash -c '\''trap "" TERM; echo $$ > "$STUB_LOG/grandchild"; while :; do sleep 1; done'\'' & echo $$ > "$STUB_LOG/child"; wait' &
+while [ ! -f "$STUB_LOG/grandchild" ]; do sleep 0.1; done
+echo $$ > "$STUB_LOG/pid"
+wait
+EOF
+  chmod +x "$TMP/bin/opencode"
+  AGENT_MEMORY_DREAM_TIMEOUT_SECS=2 AGENT_MEMORY_DREAM_KILL_GRACE=1 "$TMEM" dream >/dev/null 2>&1 || true
+  local f pid state
+  for f in child grandchild; do
+    assert_file "$STUB_LOG/$f"
+    pid="$(<"$STUB_LOG/$f")"
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    case "$state" in ''|*Z*) ;; *) fail "$f still live after timeout: $pid $state" ;; esac
+  done
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "timeout retained writer lock"
+}
+
+test_dream_policy_paths_reject_globs() {
+  dream_template_fixture
+  local name out rc=0
+  for name in 'app?' 'app*' 'app[12]'; do
+    mkdir "$TMP/code/$name"
+    printf '%s\n' "$TMP/code/$name" > "$DP1/.project-path"
+    out="$("$TMEM" dream --print-config 2>"$TMP/warning")"
+    assert_not_contains "$out" "$TMP/code/$name"
+    assert_contains "$(<"$TMP/warning")" "skipping unsafe"
+  done
+  mkdir "$TMP/home?"
+  out="$(HOME="$TMP/home?" "$TMEM" dream --print-config 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "unsafe JSON/policy"
+}
+
+test_successful_dream_persistence_failure_keeps_failed_marker() {
+  dream_template_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: successful partial\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/partial.md
+git config --global --unset user.email
+git config --global user.useConfigOnly true
+exit 0
+EOF
+  chmod +x "$TMP/bin/opencode"
+  local out rc=0
+  out="$("$TMEM" dream 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail "save failure returned success"
+  assert_contains "$out" "final persistence failed"
+  assert_file "$AGENT_MEMORY_HOME/.git/memory-dream.failed"
+  git config --global user.email test@example.com
+  out="$("$TMEM" backup)"
+  assert_contains "$out" "FAILED review"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "dream FAILED"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+}
+
+test_dream_update_ref_failure_keeps_failed_marker() {
+  dream_template_fixture
+  REAL_GIT="$(command -v git)"; export REAL_GIT
+  cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do if [ "$arg" = update-ref ]; then exit 9; fi; done
+exec "$REAL_GIT" "$@"
+EOF
+  chmod +x "$TMP/bin/git"
+  local out rc=0
+  out="$("$TMEM" dream 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail "ref failure returned success"
+  assert_file "$AGENT_MEMORY_HOME/.git/memory-dream.failed"
+  assert_contains "$out" "final persistence failed"
+  ! "$REAL_GIT" -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last >/dev/null || fail "advanced failed marker"
+}
+
+test_successful_dream_index_and_add_failure_keep_marker() {
+  dream_template_fixture
+  REAL_GIT="$(command -v git)"; export REAL_GIT
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: partial\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/partial.md
+if [ "$FAIL_SAVE" = index ]; then
+  printf '#!/bin/sh\nexit 8\n' > "$FAIL_BIN/mv"
+  chmod +x "$FAIL_BIN/mv"
+else
+  : > "$STUB_LOG/fail-add"
+fi
+EOF
+  cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [ -f "$STUB_LOG/fail-add" ]; then
+  for arg in "$@"; do if [ "$arg" = add ]; then exit 8; fi; done
+fi
+exec "$REAL_GIT" "$@"
+EOF
+  chmod +x "$TMP/bin/opencode" "$TMP/bin/git"
+  local mode out rc
+  for mode in index add; do
+    rc=0
+    out="$(FAIL_SAVE="$mode" FAIL_BIN="$TMP/bin" "$TMEM" dream 2>&1)" || rc=$?
+    [ "$rc" -ne 0 ] || fail "$mode save failure returned success"
+    assert_file "$AGENT_MEMORY_HOME/.git/memory-dream.failed"
+    assert_contains "$out" "final persistence failed"
+    rm -f "$TMP/bin/mv" "$STUB_LOG/fail-add"
+    "$TMEM" backup >/dev/null
+  done
+}
+
+test_backup_after_add_contention_commits_newer_edit() {
+  dream_template_fixture
+  REAL_GIT="$(command -v git)"; export REAL_GIT
+  cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+"$REAL_GIT" "$@" || exit $?
+for arg in "$@"; do
+  if [ "$arg" = add ] && [ ! -f "$STUB_LOG/release" ]; then
+    : > "$STUB_LOG/after-add"
+    while [ ! -f "$STUB_LOG/release" ]; do sleep 0.1; done
+  fi
+done
+EOF
+  chmod +x "$TMP/bin/git"
+  dfact "$DP1" contention decision "version A" 2026-09-04
+  "$TMEM" backup > "$STUB_LOG/A" 2>&1 &
+  local first=$! second i=0
+  while [ ! -f "$STUB_LOG/after-add" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+  assert_file "$STUB_LOG/after-add"
+  dfact "$DP1" contention decision "version B" 2026-09-04
+  AGENT_MEMORY_BACKUP_LOCK_WAIT=10 "$TMEM" backup > "$STUB_LOG/B" 2>&1 &
+  second=$!
+  : > "$STUB_LOG/release"
+  wait "$first"
+  wait "$second"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" show HEAD:work/projects/some-api/contention.md)" "version B"
+}
+
+
+# Stub opencode that writes a fake run database like the real one: assistant
+# rows in session_message whose content holds tool parts. STUB_TOOLS is a
+# space-separated list of  <shell-command-or-name>=<ok|denied>.
+install_db_stub() {
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+rm -f "$OPENCODE_DB"
+sqlite3 "$OPENCODE_DB" "create table session_message (id text primary key, session_id text, type text, seq integer, time_created integer, time_updated integer, data text);"
+seq=0
+for spec in $STUB_TOOLS; do
+  seq=$((seq + 1))
+  cmd="${spec%%=*}"; state="${spec#*=}"; cmd="${cmd//+/ }"
+  if [ "$state" = ok ]; then
+    part="{\"type\":\"tool\",\"name\":\"shell\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"$cmd\"}}}"
+  else
+    part="{\"type\":\"tool\",\"name\":\"shell\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"$cmd\"},\"error\":{\"type\":\"permission.rejected\",\"message\":\"Permission denied: shell\"}}}"
+  fi
+  sqlite3 "$OPENCODE_DB" "insert into session_message values ('m$seq','s','assistant',$seq,0,0,'{\"content\":[$part]}');"
+done
+exit 0
+EOF
+  chmod +x "$TMP/bin/opencode"
+}
+
+dream_db_fixture() {
+  command -v sqlite3 >/dev/null 2>&1 || { echo "  (skipped: sqlite3 not found)"; return 1; }
+  dream_launch_fixture
+  install_db_stub
+}
+
+test_dream_all_tools_denied_is_a_failed_run() {
+  dream_db_fixture || return 0
+  local out rc=0
+  out="$(STUB_TOOLS='x=denied y=denied' "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "sandbox denied the agent's tools; run not counted"
+  assert_contains "$out" "0 tool call(s) succeeded, 2 denied"
+  ! git -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last >/dev/null \
+    || fail "success ref advanced after a broken sandbox"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left behind"
+}
+
+test_dream_denied_first_report_call_is_a_failed_run() {
+  dream_db_fixture || return 0
+  local out rc=0
+  out="$(STUB_TOOLS='/x/memory+dream+--report+now=denied other=ok' "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "run not counted"
+  ! git -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last >/dev/null \
+    || fail "success ref advanced although the report was denied"
+}
+
+test_dream_other_denials_are_reported_but_not_fatal() {
+  dream_db_fixture || return 0
+  local out
+  out="$(STUB_TOOLS='/x/memory+dream+--report+now=ok probe=denied probe2=denied' "$MEMORY" dream 2>&1)"
+  assert_contains "$out" "2 tool call(s) were denied by the sandbox (1 succeeded)"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+}
+
+test_dream_unreadable_session_db_warns_and_still_succeeds() {
+  dream_launch_fixture   # default stub writes no database
+  local out
+  out="$("$MEMORY" dream 2>&1)"
+  if command -v sqlite3 >/dev/null 2>&1; then
+    assert_contains "$out" "cannot inspect the session database"
+  fi
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+}
+
+test_dream_signal_prints_interrupted_notice() {
+  dream_launch_fixture
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: interrupted edit\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' > work/projects/some-api/interrupted.md
+echo $$ > "$STUB_LOG/pid"
+exec sleep 60
+EOF
+  chmod +x "$TMP/bin/opencode"
+  AGENT_MEMORY_DREAM_KILL_GRACE=1 "$MEMORY" dream > "$STUB_LOG/dream-out" 2>&1 &
+  local dpid=$! i=0
+  while [ ! -s "$STUB_LOG/pid" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+  assert_file "$STUB_LOG/pid"
+  kill -TERM "$dpid"
+  wait "$dpid" 2>/dev/null || true
+  assert_contains "$(<"$STUB_LOG/dream-out")" "opencode run interrupted (exit 143)"
+  assert_contains "$(<"$STUB_LOG/dream-out")" "committed as FAILED review"
+}
+
+
+# Stub opencode that runs $STUB_ACT (a shell snippet) inside the store, then exits 0.
+install_acting_stub() {
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+eval "$STUB_ACT"
+exit 0
+EOF
+  chmod +x "$TMP/bin/opencode"
+}
+
+FACT_BODY='---\ndescription: escaped\ntype: decision\ncreated: 2026-09-04\n---\nbody\n'
+
+assert_escape_is_failed_review() {   # assert_escape_is_failed_review <act> <expected-path>
+  local out rc=0 marker_before
+  marker_before="$(git -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last || true)"
+  out="$(STUB_ACT="$1" "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "run not counted"
+  assert_contains "$out" "$2"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "dream FAILED"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%B)" "$2"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last || true)" "$marker_before"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left behind"
+  # Nothing is deleted automatically.
+  [ -e "$AGENT_MEMORY_HOME/$2" ] || fail "unexpected path was deleted: $2"
+}
+
+test_dream_new_project_directory_is_a_failed_review() {
+  dream_launch_fixture
+  install_acting_stub
+  assert_escape_is_failed_review "mkdir work/projects/brand-new && printf -- '$FACT_BODY' > work/projects/brand-new/x.md" "work/projects/brand-new/x.md"
+}
+
+test_dream_new_group_directory_is_a_failed_review() {
+  dream_launch_fixture
+  install_acting_stub
+  assert_escape_is_failed_review "mkdir -p work/groups/brand-new && printf -- '$FACT_BODY' > work/groups/brand-new/x.md" "work/groups/brand-new/x.md"
+}
+
+test_dream_nested_hidden_and_non_markdown_files_are_failed_reviews() {
+  dream_launch_fixture
+  install_acting_stub
+  assert_escape_is_failed_review "mkdir work/projects/some-api/deeper && printf -- '$FACT_BODY' > work/projects/some-api/deeper/x.md" "work/projects/some-api/deeper/x.md"
+  assert_escape_is_failed_review "printf x > work/projects/some-api/.hidden.md" "work/projects/some-api/.hidden.md"
+  assert_escape_is_failed_review "printf x > work/projects/some-api/notes.txt" "work/projects/some-api/notes.txt"
+}
+
+test_dream_deleted_fact_is_a_failed_review_without_deleting_more() {
+  dream_launch_fixture
+  install_acting_stub
+  local out rc=0
+  out="$(STUB_ACT='rm work/projects/some-api/stale-fact.md' "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "work/projects/some-api/stale-fact.md"
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)" "dream FAILED"
+}
+
+test_dream_staged_rename_is_reported_as_plain_delete_and_add() {
+  dream_launch_fixture
+  install_acting_stub
+  local out rc=0
+  # A staged rename of an almost identical file: git would pair them as "R".
+  out="$(STUB_ACT='git mv work/projects/some-api/stale-fact.md work/projects/some-api/renamed-fact.md' "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "run not counted"
+  assert_contains "$out" "
+  work/projects/some-api/stale-fact.md
+"
+  assert_not_contains "$out" " -> "
+  assert_contains "$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%B)" "- work/projects/some-api/stale-fact.md"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+  ! git -C "$AGENT_MEMORY_HOME" rev-parse -q --verify refs/memory-dream/last >/dev/null || fail "ref advanced"
+}
+
+test_dream_allowed_writes_in_existing_levels_still_succeed() {
+  dream_launch_fixture
+  install_acting_stub
+  local out
+  out="$(STUB_ACT="printf -- '$FACT_BODY' > work/projects/some-api/new-fact.md; printf -- '$FACT_BODY' > work/workspace/ws-fact.md" "$MEMORY" dream 2>&1)"
+  assert_not_contains "$out" "run not counted"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+  assert_contains "$(<"$DP1/INDEX.md")" "new-fact"
+}
+
+test_dream_refuses_to_run_with_symlinks_in_the_store() {
+  dream_launch_fixture
+  mkdir "$TMP/outside"
+  ln -s "$TMP/outside" "$DP1/escape"
+  local out rc=0 head
+  head="$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+  out="$("$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "store contains symlinks"
+  assert_contains "$out" "$DP1/escape"
+  [ ! -e "$STUB_LOG/args" ] || fail "opencode launched with a symlink in the store"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)" "$head"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left behind"
+  # A symlinked fact is caught too.
+  rm "$DP1/escape"
+  ln -s "$TMP/outside" "$DP1/linked-fact.md"
+  rc=0; out="$("$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "linked-fact.md"
+}
+
+test_legit_init_and_link_group_leave_no_symlinks_in_the_store() {
+  "$MEMORY" init work >/dev/null
+  "$MEMORY" link-group shared >/dev/null
+  mkdir "$TMP/code/second"
+  (cd "$TMP/code/second" && "$MEMORY" init work >/dev/null && "$MEMORY" link-group shared >/dev/null)
+  assert_eq "$(find "$AGENT_MEMORY_HOME" -name .git -prune -o -type l -print)" ""
+  [ -L .memory/project ] || fail "the .memory links must stay in the project directory"
 }
 
 # ---------------- runner ----------------

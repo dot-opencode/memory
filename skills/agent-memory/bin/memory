@@ -33,7 +33,7 @@ use_utf8_ctype
 
 # Make a relative store location independent of later directory changes.  The
 # store itself is canonicalized by init before it is used as a link target.
-MEMORY_HOME="${AGENT_MEMORY_HOME:-$HOME/.agent-memory}"
+MEMORY_HOME="${AGENT_MEMORY_HOME:-${HOME:?HOME is not set}/.agent-memory}"
 case "$MEMORY_HOME" in
   /*) ;;
   *) MEMORY_HOME="$(pwd -P)/$MEMORY_HOME" ;;
@@ -52,7 +52,8 @@ commands:
   grep <pattern> [grep opts]                search all linked levels (follows the symlinks)
   doctor                                    check symlinks, indexes, frontmatter
   dream --report [--stale-days N] [--workspace <ws>]  read-only whole-store report: duplicates, stale facts
-  dream [--workspace <ws>] [--model <m>] [--if-changed] [--full] [--print-config]  tidy the store with a sandboxed OpenCode run
+  dream [--workspace <ws>] [--model <m>] [--if-changed] [--full] [--web] [--timeout <min>] [--print-config]
+                                            tidy the store with a sandboxed OpenCode run
   backup [--push]                           commit (and push) the store
   install-opencode                          install the global OpenCode plugin
 EOF
@@ -137,6 +138,17 @@ ensure_global_gitignore() {
   echo "added '.memory/' to global gitignore ($f)"
 }
 
+# Reject symlinks in new write destinations, including intermediate components.
+# This conservative rule avoids following links before creating missing parents.
+validate_store_destination() {
+  local path="$1" cur="$1"
+  is_in_store "$path" || die "unsafe store destination: $path"
+  while [ "$cur" != "$STORE_HOME" ]; do
+    [ ! -L "$cur" ] || die "unsafe symlink destination: $cur"
+    cur="$(dirname "$cur")"
+  done
+}
+
 cmd_init() {
   local workspace="" name="" name_given=0 proj existing_workspace g target item found
   while [ $# -gt 0 ]; do
@@ -192,18 +204,24 @@ cmd_init() {
     fi
   fi
 
-  if [ ! -d "$STORE_HOME/.git" ]; then git -C "$STORE_HOME" init -q; fi
-  mkdir -p "$ws/workspace" "$ws/groups" "$ws/projects"
-  [ -f "$ws/workspace/INDEX.md" ] || : > "$ws/workspace/INDEX.md"
-
+  if [ -L .memory/project ]; then
+    target="$(safe_link_target .memory/project)"
+    case "$target" in "$ws"/projects/*) ;; *) die ".memory/project is bound outside workspace '$workspace'" ;; esac
+  fi
   local here recorded recorded_canon
   here="$(pwd -P)"
   if [ "$name_given" -eq 0 ] && [ -L .memory/project ]; then
     proj="$(safe_link_target .memory/project)" || die "unsafe symlink: .memory/project"
+    case "$proj" in
+      "$ws"/projects/*) ;;
+      *) die ".memory/project is bound to $proj, outside workspace '$workspace'; unlink/rebind it explicitly before initializing '$workspace'" ;;
+    esac
   else
     [ -n "$name" ] || name="$(basename "$here")"
     require_slug "project name" "$name"
     proj="$ws/projects/$name"
+    validate_store_destination "$proj/.project-path"
+    validate_store_destination "$proj/INDEX.md"
     if [ -f "$proj/.project-path" ]; then
       recorded="$(<"$proj/.project-path")"
       # Only a path that exists on this machine and is a different directory
@@ -214,6 +232,32 @@ cmd_init() {
       fi
     fi
   fi
+  validate_store_destination "$ws/workspace/INDEX.md"
+  validate_store_destination "$ws/groups"
+  validate_store_destination "$ws/projects"
+  validate_store_destination "$proj/INDEX.md"
+  validate_store_destination "$proj/.project-path"
+  if [ ! -d "$STORE_HOME/.git" ]; then git -C "$STORE_HOME" init -q; fi
+  # Temporary index files and dream scratch files must never be backed up.
+  local exclude="$STORE_HOME/.git/info/exclude" pat
+  if [ -d "$STORE_HOME/.git" ]; then
+    mkdir -p "$STORE_HOME/.git/info"
+    if [ -f "$exclude" ]; then
+      local excludes
+      excludes="$(grep -vxF 'memory-dream.*' "$exclude" || true)"
+      printf '%s\n' "$excludes" > "$exclude"
+    fi
+    # shellcheck disable=SC2041 # literal ignore pattern
+    for pat in '.memory-index.*'; do
+      if [ ! -f "$exclude" ] || ! grep -qxF "$pat" "$exclude"; then
+        if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then printf '\n' >> "$exclude"; fi
+        printf '%s\n' "$pat" >> "$exclude"
+      fi
+    done
+  fi
+  mkdir -p "$ws/workspace" "$ws/groups" "$ws/projects"
+  [ -f "$ws/workspace/INDEX.md" ] || : > "$ws/workspace/INDEX.md"
+
   mkdir -p "$proj"
   [ -f "$proj/INDEX.md" ] || : > "$proj/INDEX.md"
   printf '%s\n' "$here" > "$proj/.project-path"
@@ -251,6 +295,7 @@ cmd_link_group() {
     existing="$(safe_link_target ".memory/groups/$group")" || die "unsafe symlink: .memory/groups/$group"
     [ "$existing" = "$gdir" ] || die ".memory/groups/$group is bound to a different group target"
   fi
+  validate_store_destination "$gdir/INDEX.md"
   mkdir -p "$gdir"
   [ -f "$gdir/INDEX.md" ] || : > "$gdir/INDEX.md"
   mkdir -p .memory/groups
@@ -428,6 +473,7 @@ render_index() {
   } | LC_ALL=C sort | while IFS= read -r f; do
     base="$(basename "$f")"
     [ "$base" = "INDEX.md" ] && continue
+    [ ! -L "$f" ] || continue   # a symlinked fact could point outside the store
     if ! reason="$(fact_is_usable "$f")"; then
       echo "memory: skipping $display/$base: $reason" >&2
       continue
@@ -440,11 +486,22 @@ render_index() {
 
 # Lock of a live `memory dream`; removed on exit or signal by cleanup_on_exit.
 DREAM_LOCK_FILE=""
+# Background `opencode run` of the current dream, killed on timeout or signal.
+DREAM_CHILD_PID=""
 
 # shellcheck disable=SC2329 # invoked from traps
 cleanup_on_exit() {
+  local exit_rc=$?
+  # Includes failures after a successful agent: reindex, add, commit, SHA read,
+  # and update-ref. Never release an unfinished dream as ordinary dirty work.
+  if [ "${DREAM_ACTIVE:-0}" -eq 1 ] && [ -n "$DREAM_LOCK_FILE" ]; then
+    [ "$exit_rc" -ne 0 ] || exit_rc=1
+    printf '%s\n' "$exit_rc" > "$(store_gitdir)/memory-dream.failed"
+    echo "memory: dream final persistence failed (exit $exit_rc); FAILED review marker retained. Fix git/index errors and run memory backup; changes must be reviewed." >&2
+  fi
+  dream_kill_child
   cleanup_index_temps
-  [ -z "$DREAM_LOCK_FILE" ] || rm -f "$DREAM_LOCK_FILE"
+  if [ -n "$DREAM_LOCK_FILE" ]; then dream_release_lock; fi
 }
 
 # shellcheck disable=SC2329 # called from cleanup_on_exit
@@ -464,10 +521,12 @@ publish_indexes() {
   local -a temps=()
   INDEX_TEMP_FILES=()
   trap 'cleanup_on_exit' EXIT
-  trap 'cleanup_on_exit; exit 1' HUP INT TERM
+  trap 'dream_signal 143' HUP INT TERM
   i=0
   while [ "$i" -lt "${#PUBLISH_LEVELS[@]}" ]; do
     level="${PUBLISH_LEVELS[$i]}"
+    # Leftovers of a killed run; fresh ones may belong to a concurrent `memory index`.
+    find "$level" -maxdepth 1 -name '.memory-index.*' -mmin +10 -exec rm -f {} + 2>/dev/null || true
     temp="$(mktemp "$level/.memory-index.XXXXXX")" || die "cannot create temporary index in $level"
     INDEX_TEMP_FILES+=("$temp")
     if ! render_index "$level" "${PUBLISH_LABELS[$i]}" > "$temp"; then
@@ -605,7 +664,7 @@ doctor_warnings() {
       while IFS= read -r slug; do
         [ -n "$slug" ] || continue
         wiki_target_exists "$slug" || echo "DANGLING WIKI LINK: $level/$base -> [[$slug]]"
-      done < <(grep -o '\[\[[a-z0-9-]*\]\]' "$f" | sed 's/^\[\[//; s/\]\]$//' | sort -u)
+      done < <(LC_ALL=C grep -a -o '\[\[[a-z0-9-]*\]\]' "$f" | LC_ALL=C sed 's/^\[\[//; s/\]\]$//' | LC_ALL=C sort -u)
     done
   done
   return 0
@@ -628,6 +687,12 @@ doctor_problems() {
   done
   # bash < 4.4 aborts on "${levels[@]}" when the array is empty under set -u.
   [ "${#levels[@]}" -gt 0 ] || return 0
+  local pt wt
+  if pt="$(safe_link_target .memory/project 2>/dev/null)" && wt="$(safe_link_target .memory/workspace 2>/dev/null)"; then
+    if [ "$(dirname "$(dirname "$pt")")" != "$(dirname "$wt")" ]; then
+      echo "WORKSPACE MISMATCH: .memory/project belongs to workspace '$(basename "$(dirname "$(dirname "$pt")")")' but .memory/workspace to '$(basename "$(dirname "$wt")")'"
+    fi
+  fi
   for level in "${levels[@]}"; do
     [ -f "$level/INDEX.md" ] || { echo "MISSING INDEX: $level/INDEX.md"; continue; }
     check_index "$level/INDEX.md"
@@ -887,6 +952,10 @@ dream_report() {   # dream_report <stale-days> [<workspace>]
         unusable="$unusable  $fpath — not a regular file$nl"
         continue
       fi
+      if [ -L "$f" ]; then
+        hygiene="$hygiene  symlinked fact ignored: $fpath$nl"
+        continue
+      fi
       if ! reason="$(fact_is_usable "$f")"; then
         reason="$(printf '%s\n' "$reason" | while IFS= read -r line; do printf '%s; ' "${line%": $f"}"; done)"
         unusable="$unusable  $fpath — ${reason%; }$nl"
@@ -907,7 +976,7 @@ dream_report() {   # dream_report <stale-days> [<workspace>]
       [ "${#desc}" -le 120 ] || hygiene="$hygiene  long description (${#desc} chars): $fpath$nl"
       # A here-string, not `< <(...)`: bash 3.2 leaks a descriptor per process
       # substitution and dies with SIGTRAP after a few hundred facts.
-      links="$(grep -o '\[\[[a-z0-9-]*\]\]' "$f" | sed 's/^\[\[//; s/\]\]$//' | LC_ALL=C sort -u || true)"
+      links="$(LC_ALL=C grep -a -o '\[\[[a-z0-9-]*\]\]' "$f" | LC_ALL=C sed 's/^\[\[//; s/\]\]$//' | LC_ALL=C sort -u || true)"
       while IFS= read -r wslug; do
         [ -n "$wslug" ] || continue
         dream_wiki_exists "$ws" "$wslug" || hygiene="$hygiene  dangling link: $fpath -> [[$wslug]]$nl"
@@ -964,16 +1033,96 @@ index_rebuild_levels() {   # index_rebuild_levels [<workspace>]
   publish_indexes >/dev/null
 }
 
+json_path_safe() {
+  case "$1" in *'"'*|*'\'*|*$'\n'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+  ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'
+}
+
+# Code directories recorded by the projects of the store (one absolute path
+# per line, sorted, unique), limited to one workspace when given. Missing
+# directories and paths JSON/prompt templates cannot hold safely are skipped.
+dream_project_dirs() {   # dream_project_dirs [<workspace>]
+  local i=0 level code canon out="" nl=$'\n' bs=$'\\' quote='"'
+  dream_collect_levels "${1:-}"
+  while [ "$i" -lt "${#DREAM_LEVELS[@]}" ]; do
+    level="${DREAM_LEVELS[$i]}"
+    case "${DREAM_RELS[$i]}" in
+      */projects/*)
+        code=""
+        if [ -f "$level/.project-path" ]; then code="$(cat "$level/.project-path")"; fi
+        json_path_safe "$code" || { echo "memory: skipping unsafe project path: $code" >&2; code=""; }
+        case "$code" in
+          /*) ;;
+          *) code="" ;;
+        esac
+        if [ -n "$code" ] && [ -d "$code" ]; then
+          case "$code" in
+            *"$quote"*|*"$bs"*|*"$nl"*) ;;
+            *)
+              canon="$(cd -P "$code" 2>/dev/null && pwd -P)" || canon=""
+              json_path_safe "$canon" || { echo "memory: skipping unsafe canonical project path: $canon" >&2; canon=""; }
+              case "$canon" in
+                ""|*"$quote"*|*"$bs"*) ;;
+                *) out="$out$canon$nl" ;;
+              esac ;;
+          esac
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  [ -z "$out" ] || printf '%s' "$out" | LC_ALL=C sort -u
+}
+
+# Line-level template tokens. A line holding __PROJECT_DIR__ is emitted once
+# per entry of DREAM_PROJECT_DIRS (deleted when there is none); a line holding
+# __WEB_ONLY__ is kept, token removed, only when DREAM_WEB=1.
+dream_filter_lines() {   # dream_filter_lines <text>
+  local line dir out="" nl=$'\n'
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *__WEB_ONLY__*)
+        [ "${DREAM_WEB:-0}" -eq 1 ] || continue
+        line="${line//__WEB_ONLY__/}" ;;
+    esac
+    case "$line" in
+      *__PROJECT_DIR__*)
+        while IFS= read -r dir; do
+          [ -n "$dir" ] || continue
+          out="$out${line//__PROJECT_DIR__/$dir}$nl"
+        done <<< "${DREAM_PROJECT_DIRS:-}"
+        continue ;;
+    esac
+    out="$out$line$nl"
+  done <<< "$1"
+  printf '%s' "${out%"$nl"}"
+}
+
 # Replace every __NAME__ placeholder of a template. Placeholder values were
 # checked for JSON-unsafe characters by the caller. patsub_replacement (bash
 # 5.2+) would give '&' in a value a special meaning, so it is turned off.
-dream_render() {   # dream_render <template> <store> <memory-bin> <home>
-  shopt -u patsub_replacement 2>/dev/null || true
-  local text="$1"
-  text="${text//__STORE__/$2}"
-  text="${text//__MEMORY_BIN__/$3}"
-  text="${text//__HOME__/$4}"
-  printf '%s\n' "$text"
+dream_render() {   # single-pass literal insertion; values are never templates
+  printf '%s\n' "$1" | DREAM_STORE="$2" DREAM_BIN="$3" DREAM_HOME="$4" \
+    DREAM_DIRS="${DREAM_PROJECT_DIRS:-}" DREAM_WEB="${DREAM_WEB:-0}" LC_ALL=C awk '
+    BEGIN { n=split(ENVIRON["DREAM_DIRS"], dirs, "\n") }
+    function render(line, dir,   out,i,t,v) {
+      out=""
+      while (match(line, /__(STORE|MEMORY_BIN|HOME|PROJECT_DIR|WEB_ONLY)__/)) {
+        t=substr(line,RSTART,RLENGTH); v=""
+        if(t=="__STORE__") v=ENVIRON["DREAM_STORE"]
+        if(t=="__HOME__") v=ENVIRON["DREAM_HOME"]
+        if(t=="__MEMORY_BIN__") v=ENVIRON["DREAM_BIN"]
+        if(t=="__PROJECT_DIR__") v=dir
+        out=out substr(line,1,RSTART-1) v; line=substr(line,RSTART+RLENGTH)
+      }
+      return out line
+    }
+    {
+      if(index($0,"__WEB_ONLY__") && ENVIRON["DREAM_WEB"]!="1") next
+      if(index($0,"__PROJECT_DIR__")) {
+        for(k=1;k<=n;k++) if(dirs[k]!="") print render($0,dirs[k])
+      } else print render($0,"")
+    }'
 }
 
 # Fact files added or changed since <ref>, including uncommitted and untracked
@@ -1004,16 +1153,239 @@ dream_focus() {   # dream_focus <last-run-ref> [<workspace>]
   printf '%s\n' "In step 2, handle hygiene items, and other items only when they involve one of these facts. In step 3, read only the INDEX.md files of the levels holding these facts, plus their groups and workspace, and compare these facts with the rest; do not re-check facts that are not listed."
 }
 
+# Absolute git directory of the store (lock and scratch files live there).
+store_gitdir() { git -C "$STORE_HOME" rev-parse --absolute-git-dir 2>/dev/null; }
+
+# git on the store as a service repo: never prompts, signs, opens an editor or
+# runs the user's hooks.
+store_git() {
+  env GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true \
+    git -C "$STORE_HOME" -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"
+}
+
+# Run a command, retrying while another git process holds .git/index.lock.
+store_retry() {
+  local i=1 rc gd
+  gd="$(store_gitdir)" || gd="$STORE_HOME/.git"
+  while :; do
+    "$@" && return 0
+    rc=$?
+    { [ "$i" -lt 5 ] && [ -e "$gd/index.lock" ]; } || return "$rc"
+    i=$((i + 1))
+    sleep 1
+  done
+}
+
+# Job control gives the run its own process group on Bash 3.2, without setsid.
+# Signal the entire group, including grandchildren after their parent exits.
+DREAM_WATCHDOG_PID=""
+DREAM_CHILD_GROUP=""
+DREAM_KILL_GRACE="${AGENT_MEMORY_DREAM_KILL_GRACE:-5}"
+DREAM_ACTIVE=0
+DREAM_STDERR_SAVED=0
+# Store-relative level directories that existed before the agent ran.
+DREAM_LEVELS_BEFORE=""
+DREAM_FAIL_DETAIL=""
+DREAM_WORKSPACE=""
+
+dream_kill_tree() {
+  kill -s "$2" -- "-$1" 2>/dev/null || true
+}
+
+dream_stop_watchdog() {
+  [ -n "$DREAM_WATCHDOG_PID" ] || return 0
+  dream_kill_tree "$DREAM_WATCHDOG_PID" KILL
+  { wait "$DREAM_WATCHDOG_PID" || true; } 2>/dev/null
+  DREAM_WATCHDOG_PID=""
+}
+
+dream_kill_child() {
+  dream_stop_watchdog
+  [ -n "$DREAM_CHILD_GROUP" ] || return 0
+  dream_kill_tree "$DREAM_CHILD_GROUP" TERM
+  sleep "$DREAM_KILL_GRACE"
+  dream_kill_tree "$DREAM_CHILD_GROUP" KILL
+  { wait "$DREAM_CHILD_PID" || true; } 2>/dev/null
+  DREAM_CHILD_PID=""
+  DREAM_CHILD_GROUP=""
+}
+
+# Atomic directory creation is the common writer protocol for ALL backups and
+# dreams. Incomplete metadata is not evidence of staleness. We deliberately do
+# not auto-remove stale locks: unlink/takeover cannot safely compare directory
+# identity atomically in portable shell. Recovery requires an operator to
+# verify the recorded pid/start and remove the directory while writers are idle.
+writer_lock_recovery_help() {
+  local lock
+  lock="$(store_gitdir)/memory-dream.lock"
+  echo "Writer lock: $lock (pid $(dream_lock_holder)). Stop ALL memory writers before manual recovery."
+  if [ -d "$lock" ]; then
+    echo "Inspect owner metadata $lock/owner; verify BOTH PID and process start time with ps -o lstart= -p <PID>. Unpublished/missing metadata is uncertain, not stale. Only after verifying no writer is active, remove owner then rmdir the lock directory."
+  else
+    echo "Legacy lock FILE (not directory): inspect $lock and verify PID/start identity; only after verifying no writer is active remove this file."
+  fi
+}
+
+dream_lock_acquire() {
+  local lock start
+  [ -z "$DREAM_LOCK_FILE" ] || return 0
+  lock="$(store_gitdir)/memory-dream.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    return 1
+  fi
+  DREAM_LOCK_FILE="$lock"
+  trap 'cleanup_on_exit' EXIT
+  trap 'dream_signal 143' HUP INT TERM
+  start="$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^ *//; s/ *$//' || true)"
+  printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
+}
+
+dream_release_lock() {
+  if [ -n "$DREAM_LOCK_FILE" ]; then
+    rm -f "$DREAM_LOCK_FILE/owner"
+    rmdir "$DREAM_LOCK_FILE" || die "cannot release writer lock $DREAM_LOCK_FILE"
+  fi
+  DREAM_LOCK_FILE=""
+  trap - EXIT HUP INT TERM
+}
+
+# A persistent failure marker is published BEFORE attempting a commit, so an
+# identity/index failure cannot make the next backup silently absorb the run.
+# 0 = committed, 2 = no changes, 3 = staging/commit failure (marker retained).
+dream_commit_failed() {   # dream_commit_failed <rc> [<detail>]
+  local marker detail="${2:-}"
+  local -a msgargs
+  marker="$(store_gitdir)/memory-dream.failed"
+  { printf '%s\n' "$1"; [ -z "$detail" ] || printf '%s\n' "$detail"; } > "$marker" || return 3
+  msgargs=(-m "memory: dream FAILED (exit $1) — review")
+  [ -z "$detail" ] || msgargs+=(-m "$detail")
+  store_retry store_git add -A || return 3
+  if store_git diff --cached --quiet; then rm -f "$marker"; return 2; fi
+  store_retry store_git commit -q "${msgargs[@]}" || return 3
+  rm -f "$marker"
+}
+
+# Paths the agent left behind that the sandbox matcher cannot forbid: a fact
+# under a level directory that did not exist before the run, a nested file, a
+# hidden or non-Markdown file, a rename or a deletion. Prints one path per line;
+# nothing is deleted. Must run before the failure path reindexes the store.
+dream_unexpected_paths() {
+  local line code path level ok out="" nl=$'\n'
+  local re_lvl='^([a-z0-9][a-z0-9-]*)/(projects|groups)/([a-z0-9][a-z0-9-]*)/[^/.][^/]*\.md$'
+  local re_ws='^([a-z0-9][a-z0-9-]*)/workspace/[^/.][^/]*\.md$'
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    code="${line:0:2}"
+    path="${line:3}"
+    ok=0
+    case "$code" in
+      '??'|' M'|'M '|'A '|'AM'|'MM')
+        level=""
+        if [[ "$path" =~ $re_lvl ]]; then
+          level="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+        elif [[ "$path" =~ $re_ws ]]; then
+          level="${BASH_REMATCH[1]}/workspace"
+        fi
+        if [ -n "$level" ]; then
+          case "$nl$DREAM_LEVELS_BEFORE$nl" in *"$nl$level$nl"*) ok=1 ;; esac
+        fi ;;
+    esac
+    [ "$ok" -eq 1 ] || out="$out$path$nl"
+  # status.renames=false: a staged delete plus add must stay two plain entries
+  # ("D  old", "A  new"), never "R  old -> new", whatever the content similarity.
+  done <<< "$(store_git -c status.renames=false status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+  printf '%s' "${out%"$nl"}"
+}
+
+dream_failure_finalize() {
+  local rc="$1" why="$2" status=0 unexpected
+  DREAM_ACTIVE=0
+  DREAM_FAIL_DETAIL=""
+  unexpected="$(dream_unexpected_paths | head -n 50)"
+  if [ -n "$unexpected" ]; then
+    DREAM_FAIL_DETAIL="unexpected paths left by the agent (nothing was deleted; review them):
+$(printf '%s\n' "$unexpected" | sed 's/^/- /')"
+    echo "memory: unexpected paths left by the agent (not deleted):" >&2
+    printf '%s\n' "$unexpected" | sed 's/^/  /' >&2
+  fi
+  printf '%s\n' "$rc" > "$(store_gitdir)/memory-dream.failed"
+  index_rebuild_levels "$DREAM_WORKSPACE" || true
+  dream_commit_failed "$rc" "$DREAM_FAIL_DETAIL" || status=$?
+  case "$status" in
+    0) echo "memory: $why; changes committed as FAILED review; undo with: git -C '$STORE_HOME' revert HEAD" >&2 ;;
+    2) echo "memory: $why; the store has no changes to review" >&2 ;;
+    *) echo "memory: $why; FAILED review commit could not be created; changes remain uncommitted. Failure marker retained; fix git and run memory backup (then git -C '$STORE_HOME' revert HEAD)." >&2 ;;
+  esac
+}
+
+# Disable repeated signal traps during termination/finalization; the writer
+# lock remains held until children are killed and the failure is recorded.
+dream_signal() {
+  trap '' HUP INT TERM
+  # The trap can fire inside `{ wait ...; } 2>/dev/null`, which would swallow
+  # every notice below; restore the caller's stderr saved before the launch.
+  if [ "$DREAM_STDERR_SAVED" -eq 1 ]; then exec 2>&3; fi
+  dream_kill_child
+  if [ "$DREAM_ACTIVE" -eq 1 ]; then dream_failure_finalize "$1" "opencode run interrupted (exit $1)"; fi
+  dream_release_lock
+  exit 1
+}
+
+# Did the sandbox leave the agent any working tool? Reads the run's own session
+# database (session_message rows of type assistant; tool parts carry
+# state.status and, when denied, state.error.type "permission.rejected").
+# Sets DREAM_TOOLS_OK, DREAM_TOOLS_DENIED and DREAM_REPORT_STATE. Returns 0 when
+# the run looks sane, 1 when the sandbox broke it, 2 when it cannot be inspected.
+DREAM_TOOLS_OK=0
+DREAM_TOOLS_DENIED=0
+dream_sandbox_check() {   # dream_sandbox_check <db>
+  local db="$1" out="" report=""
+  DREAM_TOOLS_OK=0; DREAM_TOOLS_DENIED=0
+  command -v sqlite3 >/dev/null 2>&1 || return 2
+  [ -f "$db" ] || return 2
+  out="$(sqlite3 -readonly -separator '|' "$db" "
+    WITH t AS (
+      SELECT m.seq AS seq, j.key AS k,
+             json_extract(j.value, '\$.name') AS name,
+             json_extract(j.value, '\$.state.status') AS status,
+             json_extract(j.value, '\$.state.input.command') AS cmd,
+             (coalesce(json_extract(j.value, '\$.state.error.type'), '') = 'permission.rejected'
+              OR coalesce(json_extract(j.value, '\$.state.error.message'), '') LIKE 'Permission denied%') AS denied
+      FROM session_message m, json_each(json_extract(m.data, '\$.content')) j
+      WHERE m.type = 'assistant' AND json_extract(j.value, '\$.type') = 'tool')
+    SELECT (SELECT count(*) FROM t WHERE status = 'completed'),
+           (SELECT count(*) FROM t WHERE denied = 1),
+           coalesce((SELECT status || ':' || denied FROM t
+                     WHERE name = 'shell' AND cmd LIKE '%dream --report%'
+                     ORDER BY seq, k LIMIT 1), '');
+  " 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 2
+  DREAM_TOOLS_OK="${out%%|*}"
+  out="${out#*|}"
+  DREAM_TOOLS_DENIED="${out%%|*}"
+  report="${out#*|}"
+  case "$DREAM_TOOLS_OK$DREAM_TOOLS_DENIED" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$DREAM_TOOLS_OK" -gt 0 ] || return 1
+  case "$report" in *:1) return 1 ;; esac
+  return 0
+}
+
 cmd_dream() {
-  local usage="usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--if-changed] [--full] [--print-config]"
+  local usage="usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--if-changed] [--full] [--web] [--timeout <minutes>] [--print-config]"
   # AGENT_MEMORY_DREAM_MODEL sets the default model; --model overrides it.
-  local report=0 stale_days="" workspace="" model="${AGENT_MEMORY_DREAM_MODEL:-}" print_config=0 model_flag=0 if_changed=0 full=0
+  local report=0 stale_days="" workspace="" model="${AGENT_MEMORY_DREAM_MODEL:-}" print_config=0 model_flag=0 if_changed=0 full=0 web=0
+  local timeout_min="${AGENT_MEMORY_DREAM_TIMEOUT:-120}" timeout_flag=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --report) report=1; shift ;;
       --print-config) print_config=1; shift ;;
       --if-changed) if_changed=1; shift ;;
       --full) full=1; shift ;;
+      --web) web=1; shift ;;
+      --timeout)
+        [ $# -ge 2 ] || die "$usage"
+        case "$2" in ''|*[!0-9]*) die "$usage" ;; esac
+        timeout_min="$2"; timeout_flag=1; shift 2 ;;
       --stale-days)
         [ $# -ge 2 ] || die "$usage"
         case "$2" in ''|*[!0-9]*) die "$usage" ;; esac
@@ -1029,11 +1401,15 @@ cmd_dream() {
     esac
   done
   if [ "$report" -eq 1 ]; then
-    { [ "$model_flag" -eq 0 ] && [ "$print_config" -eq 0 ] && [ "$if_changed" -eq 0 ] && [ "$full" -eq 0 ]; } || die "$usage"
+    { [ "$model_flag" -eq 0 ] && [ "$print_config" -eq 0 ] && [ "$if_changed" -eq 0 ] && [ "$full" -eq 0 ] \
+      && [ "$web" -eq 0 ] && [ "$timeout_flag" -eq 0 ]; } || die "$usage"
   else
     [ -z "$stale_days" ] || die "$usage"
   fi
   [ -n "$stale_days" ] || stale_days=180
+  case "$timeout_min" in ''|*[!0-9]*) die "invalid dream timeout '$timeout_min': use a whole number of minutes" ;; esac
+  timeout_min="$((10#$timeout_min))"
+  [ "$timeout_min" -gt 0 ] || die "$usage"
 
   [ -d "$MEMORY_HOME" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
   STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
@@ -1053,14 +1429,18 @@ cmd_dream() {
   fi
 
   local script assets config prompt nlchar=$'\n' bs=$'\\' quote='"' bad
+  json_path_safe "${BASH_SOURCE[0]}" || die "cannot run dream: CLI path has unsafe JSON/policy metacharacters"
   script="$(canonical_path "${BASH_SOURCE[0]}")" || die "cannot resolve CLI path"
   assets="$(cd -P "$(dirname "$script")/.." && pwd -P)/dream"
   [ -f "$assets/opencode.json" ] && [ -f "$assets/prompt.md" ] || die "dream assets not found in $assets"
-  for bad in "$STORE_HOME" "$HOME" "$script"; do
+  for bad in "$MEMORY_HOME" "$STORE_HOME" "${HOME:-}" "$script"; do
+    json_path_safe "$bad" || die "cannot run dream: path contains control characters or unsafe JSON/policy metacharacters (quote, backslash, newline, glob)"
     case "$bad" in
       *"$quote"*|*"$bs"*|*"$nlchar"*) die "cannot run dream: path contains a quote, backslash or newline: $bad" ;;
     esac
   done
+  DREAM_WEB="$web"
+  DREAM_PROJECT_DIRS="$(dream_project_dirs "$workspace")"
   config="$(<"$assets/opencode.json")"
   prompt="$(<"$assets/prompt.md")"
   config="$(dream_render "$config" "$STORE_HOME" "$script" "$HOME")"
@@ -1077,54 +1457,136 @@ cmd_dream() {
     return 0
   fi
 
+  # The agent's read/edit rules match path strings, so a symlink inside the
+  # store pointing elsewhere would be followed. Legitimate stores never hold
+  # one (init/link-group only create links under .memory/ of a project).
+  local store_links
+  store_links="$(find "$STORE_HOME" -name .git -prune -o -type l -print 2>/dev/null | head -n 20 || true)"
+  if [ -n "$store_links" ]; then
+    die "cannot run dream: the store contains symlinks, which the agent's path rules would follow; remove them first:
+$(printf '%s\n' "$store_links" | sed 's/^/  /')"
+  fi
+
+  # The lock comes first: the pre-run backup and the --if-changed check must not
+  # race with a second dream or with plugin backups.
+  dream_lock_acquire || die "another writer or memory dream is already running on this store (pid $(dream_lock_holder)); manual recovery: $(writer_lock_recovery_help)"
+  local gitdir
+  gitdir="$(store_gitdir)" || die "cannot locate the git directory of $STORE_HOME"
+
   # Commit pending changes first so the dream result is its own revertable commit.
   if [ -n "$(git -C "$STORE_HOME" status --porcelain --untracked-files=all)" ]; then
     cmd_backup >/dev/null
     echo "dream: committed pending store changes first"
   fi
-  local pre="" rc=0
+  local pre="" rc=0 timed_out=0
   pre="$(git -C "$STORE_HOME" rev-parse -q --verify HEAD 2>/dev/null || true)"
 
   # --if-changed: skip when no fact changed since the last successful run
   # (a local ref, never pushed), so a nightly job costs nothing on quiet days.
   # Only fact files count: INDEX.md, .project-path and the like are ignored.
   if [ "$if_changed" -eq 1 ] && [ -n "$pre" ] && [ -n "$last" ] \
-     && [ -z "$(git -C "$STORE_HOME" diff --name-only "$last" "$pre" -- '*.md' ':!*INDEX.md' ${workspace:+"$workspace/"})" ]; then
+     && [ -z "$(git -C "$STORE_HOME" diff --name-only "$last" "$pre" -- ${workspace:+"$workspace/"} | grep -E '\.md$' | grep -v -E '(^|/)INDEX\.md$' || true)" ]; then
+    dream_release_lock
     echo "dream: no fact changed since the last run — skipping"
     return 0
   fi
 
-  local holder
-  holder="$(dream_lock_holder)"
-  [ -z "$holder" ] || die "another 'memory dream' is already running on this store (pid $holder)"
-  DREAM_LOCK_FILE="$STORE_HOME/.git/memory-dream.lock"
-  printf '%s\n' "$$" > "$DREAM_LOCK_FILE"
-  DREAM_LOCK_OWNER="$$"
-  trap 'cleanup_on_exit' EXIT
-  trap 'cleanup_on_exit; exit 1' HUP INT TERM
-
   # The run gets its own OpenCode database so the unattended session stays out
   # of the user's OpenCode session list. Inside .git it is never committed;
   # wiping it first keeps only the latest run's session and bounds its size.
-  local db="$STORE_HOME/.git/memory-dream.db"
-  rm -f "$db" "$db-wal" "$db-shm"
+  local db="$gitdir/memory-dream.db" flag="$gitdir/memory-dream.timeout" secs
+  rm -f "$db" "$db-wal" "$db-shm" "$flag"
+  secs="${AGENT_MEMORY_DREAM_TIMEOUT_SECS:-$((timeout_min * 60))}"
 
   # AGENT_MEMORY_HOME is pinned so the agent's `memory dream --report` sees
-  # this store even when the caller passed a relative path.
-  (cd "$STORE_HOME" && AGENT_MEMORY_HOME="$STORE_HOME" OPENCODE_CONFIG_CONTENT="$config" \
-    OPENCODE_DB="$db" \
-    opencode run --standalone --agent memory-dream \
-    ${model:+--model "$model"} "$prompt") || rc=$?
-  [ "$rc" -eq 0 ] || die "opencode run failed (exit $rc); store changes, if any, are left uncommitted for review"
+  # this store even when the caller passed a relative path. The project-config
+  # switches keep a config or plugin written into the store from being loaded.
+  dream_collect_levels ""
+  DREAM_LEVELS_BEFORE="$(printf '%s\n' ${DREAM_RELS[@]+"${DREAM_RELS[@]}"})"
+  DREAM_ACTIVE=1
+  DREAM_WORKSPACE="$workspace"
+  exec 3>&2
+  DREAM_STDERR_SAVED=1
+  set -m
+  (
+    cd "$STORE_HOME" || exit 1
+    export AGENT_MEMORY_HOME="$STORE_HOME" OPENCODE_CONFIG_CONTENT="$config" OPENCODE_DB="$db" \
+      OPENCODE_CONFIG_PROJECT_DISABLE=1 OPENCODE_DISABLE_PROJECT_CONFIG=1
+    exec opencode run --standalone --agent memory-dream ${model:+--model "$model"} "$prompt"
+  ) 3>&- &
+  DREAM_CHILD_PID=$!
+  DREAM_CHILD_GROUP="$DREAM_CHILD_PID"
+  (
+    sleep "$secs"
+    : > "$flag"
+    dream_kill_tree "$DREAM_CHILD_GROUP" TERM
+    sleep "$DREAM_KILL_GRACE"
+    dream_kill_tree "$DREAM_CHILD_GROUP" KILL
+  ) >/dev/null 2>&1 3>&- &
+  DREAM_WATCHDOG_PID=$!
+  { wait "$DREAM_CHILD_PID" || rc=$?; } 2>/dev/null
+  # If the timeout fired, await KILL escalation even if the parent already
+  # exited on TERM. Its descendants can still hold files or keep writing.
+  if [ -e "$flag" ]; then
+    timed_out=1
+    { wait "$DREAM_WATCHDOG_PID" || true; } 2>/dev/null
+    DREAM_WATCHDOG_PID=""
+    rm -f "$flag"
+  else
+    dream_stop_watchdog
+    # Also terminate tools left by a normally exiting parent.
+    dream_kill_tree "$DREAM_CHILD_GROUP" TERM
+    if kill -0 -- "-$DREAM_CHILD_GROUP" 2>/dev/null; then
+      sleep "$DREAM_KILL_GRACE"
+      dream_kill_tree "$DREAM_CHILD_GROUP" KILL
+    fi
+  fi
+  DREAM_CHILD_PID=""
+  DREAM_CHILD_GROUP=""
+  set +m
+
+  if [ "$rc" -ne 0 ] || [ "$timed_out" -eq 1 ]; then
+    [ "$rc" -ne 0 ] || rc=1
+    local why="opencode run failed (exit $rc)"
+    [ "$timed_out" -eq 0 ] || why="opencode run timed out after $timeout_min minute(s) (exit $rc)"
+    dream_failure_finalize "$rc" "$why"
+    dream_release_lock
+    return 1
+  fi
+
+  # The matcher cannot stop new project/group directories, nested files or
+  # hidden files; the run is then a failed review, not a success.
+  if [ -n "$(dream_unexpected_paths)" ]; then
+    dream_failure_finalize 1 "the agent wrote outside the allowed fact paths; run not counted"
+    dream_release_lock
+    return 1
+  fi
+
+  # A sandbox that denies every tool makes opencode exit 0 after doing nothing;
+  # that must not count as a quiet night (and so must not advance the marker).
+  local sandbox_status=0
+  dream_sandbox_check "$db" || sandbox_status=$?
+  case "$sandbox_status" in
+    1)
+      dream_failure_finalize 1 "sandbox denied the agent's tools; run not counted ($DREAM_TOOLS_OK tool call(s) succeeded, $DREAM_TOOLS_DENIED denied)"
+      dream_release_lock
+      return 1 ;;
+    2) echo "memory: dream: cannot inspect the session database (sqlite3 or db missing); sandbox not verified" >&2 ;;
+  esac
 
   index_rebuild_levels "$workspace"
   cmd_backup >/dev/null
-  rm -f "$DREAM_LOCK_FILE"
-  DREAM_LOCK_FILE=""
-  trap - EXIT HUP INT TERM
-  if git -C "$STORE_HOME" rev-parse -q --verify HEAD >/dev/null 2>&1; then
-    git -C "$STORE_HOME" update-ref "$last_ref" HEAD
+  local final_sha
+  if store_git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    final_sha="$(store_git rev-parse --verify HEAD)"
+  elif [ -n "$(store_git status --porcelain --untracked-files=all)" ]; then
+    die "cannot resolve final dream commit"
+  else
+    final_sha="" # genuinely empty store; no commit/ref to record
   fi
+  if [ -n "$final_sha" ]; then store_git update-ref "$last_ref" "$final_sha"; fi
+  DREAM_ACTIVE=0
+  dream_release_lock
 
   local base="$pre"
   [ -n "$base" ] || base="$(git -C "$STORE_HOME" hash-object -t tree /dev/null)"
@@ -1137,6 +1599,7 @@ cmd_dream() {
   else
     echo "dream: no changes"
   fi
+  [ "$DREAM_TOOLS_DENIED" -eq 0 ] || echo "dream: $DREAM_TOOLS_DENIED tool call(s) were denied by the sandbox ($DREAM_TOOLS_OK succeeded)"
   echo "dream: session transcript in $db (latest run only)"
 }
 
@@ -1398,39 +1861,69 @@ backup_commit_message() {
   '
 }
 
-# PID of a live `memory dream` run on this store, or nothing. A lock left by a
-# dead process is removed.
+# Diagnostic only; acquisition never depends on a check-then-act pid test.
 dream_lock_holder() {
-  local lock="$MEMORY_HOME/.git/memory-dream.lock" pid=""
-  [ -f "$lock" ] || return 0
-  IFS= read -r pid < "$lock" || true
-  case "$pid" in ''|*[!0-9]*) rm -f "$lock"; return 0 ;; esac
-  if kill -0 "$pid" 2>/dev/null; then echo "$pid"; else rm -f "$lock"; fi
+  local lock pid="" start="" current
+  lock="$(store_gitdir)/memory-dream.lock"
+  if [ -d "$lock" ]; then
+    if [ ! -f "$lock/owner" ]; then echo "unpublished (do not remove)"; return; fi
+    { IFS= read -r pid; IFS= read -r start; } < "$lock/owner" || true
+  elif [ -f "$lock" ]; then
+    IFS= read -r pid < "$lock" || true
+  else
+    return 0
+  fi
+  current="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' || true)"
+  if [ -n "$start" ] && [ "$current" = "$start" ]; then echo "$pid"; else echo "$pid; stale or uncertain, manual recovery required"; fi
 }
 
 cmd_backup() {
-  local push=0 holder
+  local push=0 own_lock=0 marker failed_rc failed_detail failure_status=0
   case "$#" in 0) ;; 1) [ "$1" = "--push" ] || die "usage: memory backup [--push]"; push=1 ;; *) die "usage: memory backup [--push]" ;; esac
   [ -d "$MEMORY_HOME/.git" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
   # While `memory dream` runs, other backups (the OpenCode plugin commits after
   # every agent step, in any session) would split its result into many commits.
-  # Dream commits everything itself when it finishes.
-  holder="$(dream_lock_holder)"
-  if [ -n "$holder" ] && [ "${DREAM_LOCK_OWNER:-}" != "$holder" ]; then
-    echo "memory: 'memory dream' is running (pid $holder); skipping backup — it commits when it finishes"
-    return 0
+  # Dream commits everything itself when it finishes (and is not "another"
+  # process: DREAM_LOCK_OWNER is its own pid).
+  if [ -z "$DREAM_LOCK_FILE" ]; then
+    local attempts=0 wait_seconds="${AGENT_MEMORY_BACKUP_LOCK_WAIT:-10}"
+    case "$wait_seconds" in ''|*[!0-9]*) die "invalid AGENT_MEMORY_BACKUP_LOCK_WAIT" ;; esac
+    until dream_lock_acquire; do
+      if [ "$attempts" -ge "$wait_seconds" ]; then
+        echo "memory: backup busy; request NOT saved, retry backup (exit 75). $(writer_lock_recovery_help)" >&2
+        return 75
+      fi
+      attempts=$((attempts + 1))
+      sleep 1
+    done
+    own_lock=1
   fi
-  git -C "$MEMORY_HOME" add -A
-  if git -C "$MEMORY_HOME" diff --cached --quiet 2>/dev/null && git -C "$MEMORY_HOME" rev-parse -q --verify HEAD >/dev/null; then
+  marker="$(store_gitdir)/memory-dream.failed"
+  if [ -f "$marker" ]; then
+    failed_rc="$(head -n 1 "$marker")"
+    failed_detail="$(tail -n +2 "$marker")"
+    dream_commit_failed "$failed_rc" "$failed_detail" || failure_status=$?
+    [ "$failure_status" -ne 3 ] || die "FAILED review commit could not be created; failure marker retained"
+    if [ "$failure_status" -eq 0 ]; then echo "backed up FAILED review; undo with: git -C '$STORE_HOME' revert HEAD"; fi
+  fi
+  store_retry store_git add -A || die "git add failed in $STORE_HOME"
+  if store_git diff --cached --quiet 2>/dev/null; then
     echo "nothing to back up"
   else
     local msg
     msg="$(backup_commit_message)" || die "failed to build commit message"
-    git -C "$MEMORY_HOME" commit -q -m "$msg" \
-      || die "commit failed in $MEMORY_HOME — is git user.name / user.email configured?"
+    store_retry store_git commit -q -m "$msg" \
+      || die "commit failed in $STORE_HOME — is git user.name / user.email configured?"
     echo "backed up"
   fi
-  if [ "$push" -eq 1 ]; then git -C "$MEMORY_HOME" remote get-url origin >/dev/null 2>&1 || die "no remote configured (git -C $MEMORY_HOME remote add origin <url>)"; git -C "$MEMORY_HOME" push -q origin HEAD; fi
+  if [ "$push" -eq 1 ]; then
+    store_git remote get-url origin >/dev/null 2>&1 || die "no remote configured (git -C $STORE_HOME remote add origin <url>)"
+    store_git symbolic-ref -q HEAD >/dev/null 2>&1 \
+      || die "store is on a detached HEAD; check out a branch (git -C $STORE_HOME switch <branch>) before 'backup --push'"
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" store_git push -q origin HEAD
+  fi
+  [ "$own_lock" -eq 0 ] || dream_release_lock
 }
 
 cmd_install_opencode() {
