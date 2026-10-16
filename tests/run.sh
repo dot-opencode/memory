@@ -1675,7 +1675,7 @@ test_dream_print_config_is_valid_json() {
   command -v node >/dev/null 2>&1 || { echo "  (skipped: node not found)"; return 0; }
   dream_fixture
   local json
-  json="$("$MEMORY" dream --print-config | awk '$0 == "---" { exit } { print }')"
+  json="$("$MEMORY" dream --print-config | awk 'done { next } $0 == "---" { done = 1; next } { print }')"
   [ -n "$json" ] || fail "no config part before ---"
   printf '%s' "$json" | node -e '
     const c = JSON.parse(require("fs").readFileSync(0, "utf8"));

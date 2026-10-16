@@ -489,7 +489,7 @@ DREAM_LOCK_FILE=""
 # Background `opencode run` of the current dream, killed on timeout or signal.
 DREAM_CHILD_PID=""
 
-# shellcheck disable=SC2329 # invoked from traps
+# shellcheck disable=SC2317,SC2329 # invoked from traps
 cleanup_on_exit() {
   local exit_rc=$?
   # Includes failures after a successful agent: reindex, add, commit, SHA read,
@@ -504,7 +504,7 @@ cleanup_on_exit() {
   if [ -n "$DREAM_LOCK_FILE" ]; then dream_release_lock; fi
 }
 
-# shellcheck disable=SC2329 # called from cleanup_on_exit
+# shellcheck disable=SC2317,SC2329 # called from cleanup_on_exit
 cleanup_index_temps() {
   local temp
   [ "${#INDEX_TEMP_FILES[@]}" -gt 0 ] || return 0
@@ -1034,7 +1034,7 @@ index_rebuild_levels() {   # index_rebuild_levels [<workspace>]
 }
 
 json_path_safe() {
-  case "$1" in *'"'*|*'\'*|*$'\n'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+  case "$1" in *'"'*|*"\\"*|*$'\n'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
   ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'
 }
 
@@ -1072,30 +1072,6 @@ dream_project_dirs() {   # dream_project_dirs [<workspace>]
     i=$((i + 1))
   done
   [ -z "$out" ] || printf '%s' "$out" | LC_ALL=C sort -u
-}
-
-# Line-level template tokens. A line holding __PROJECT_DIR__ is emitted once
-# per entry of DREAM_PROJECT_DIRS (deleted when there is none); a line holding
-# __WEB_ONLY__ is kept, token removed, only when DREAM_WEB=1.
-dream_filter_lines() {   # dream_filter_lines <text>
-  local line dir out="" nl=$'\n'
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      *__WEB_ONLY__*)
-        [ "${DREAM_WEB:-0}" -eq 1 ] || continue
-        line="${line//__WEB_ONLY__/}" ;;
-    esac
-    case "$line" in
-      *__PROJECT_DIR__*)
-        while IFS= read -r dir; do
-          [ -n "$dir" ] || continue
-          out="$out${line//__PROJECT_DIR__/$dir}$nl"
-        done <<< "${DREAM_PROJECT_DIRS:-}"
-        continue ;;
-    esac
-    out="$out$line$nl"
-  done <<< "$1"
-  printf '%s' "${out%"$nl"}"
 }
 
 # Replace every __NAME__ placeholder of a template. Placeholder values were
@@ -1199,6 +1175,7 @@ dream_stop_watchdog() {
   DREAM_WATCHDOG_PID=""
 }
 
+# shellcheck disable=SC2317,SC2329 # called from traps
 dream_kill_child() {
   dream_stop_watchdog
   [ -n "$DREAM_CHILD_GROUP" ] || return 0
@@ -1320,6 +1297,7 @@ $(printf '%s\n' "$unexpected" | sed 's/^/- /')"
 
 # Disable repeated signal traps during termination/finalization; the writer
 # lock remains held until children are killed and the failure is recorded.
+# shellcheck disable=SC2317,SC2329 # invoked from traps
 dream_signal() {
   trap '' HUP INT TERM
   # The trap can fire inside `{ wait ...; } 2>/dev/null`, which would swallow
@@ -1395,7 +1373,7 @@ cmd_dream() {
         [ $# -ge 2 ] || die "$usage"
         workspace="$2"; shift 2 ;;
       --model)
-        [ $# -ge 2 ] && [ -n "$2" ] || die "$usage"
+        if [ $# -lt 2 ] || [ -z "$2" ]; then die "$usage"; fi
         model="$2"; model_flag=1; shift 2 ;;
       *) die "$usage" ;;
     esac
@@ -1432,7 +1410,9 @@ cmd_dream() {
   json_path_safe "${BASH_SOURCE[0]}" || die "cannot run dream: CLI path has unsafe JSON/policy metacharacters"
   script="$(canonical_path "${BASH_SOURCE[0]}")" || die "cannot resolve CLI path"
   assets="$(cd -P "$(dirname "$script")/.." && pwd -P)/dream"
-  [ -f "$assets/opencode.json" ] && [ -f "$assets/prompt.md" ] || die "dream assets not found in $assets"
+  if [ ! -f "$assets/opencode.json" ] || [ ! -f "$assets/prompt.md" ]; then
+    die "dream assets not found in $assets"
+  fi
   for bad in "$MEMORY_HOME" "$STORE_HOME" "${HOME:-}" "$script"; do
     json_path_safe "$bad" || die "cannot run dream: path contains control characters or unsafe JSON/policy metacharacters (quote, backslash, newline, glob)"
     case "$bad" in
