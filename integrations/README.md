@@ -16,7 +16,7 @@ the snippet makes the read-at-start rule
 unconditional instead of depending on the agent choosing to load the skill.
 
 `cursor/agent-memory.mdc` must stay identical to the snippet below its
-frontmatter — `tests/run.sh` checks this. Regenerate it after editing the
+frontmatter — `cargo test` checks this. Regenerate it after editing the
 snippet:
 
 ```bash

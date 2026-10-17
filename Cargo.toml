@@ -1,0 +1,20 @@
+[package]
+name = "agent-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Memory CLI for the agent-memory skill"
+license = "MIT"
+
+[[bin]]
+name = "memory"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

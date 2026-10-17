@@ -61,7 +61,7 @@ export function runCommand({ command, args, cwd }, { timeout = 60000, grace = 10
       cleaning = true
       signalGroup("SIGTERM")
       // Do not cancel this when the leader exits: helpers can ignore TERM and
-      // retain Git locks even after Bash has gone away.
+      // retain Git locks even after the CLI has gone away.
       killTimer = setTimeout(() => {
         signalGroup("SIGKILL")
         cleaned = true

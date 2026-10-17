@@ -58,8 +58,10 @@ advancing the last-successful-run ref. Review the result commit before reverting
 it; use `revert HEAD` only if that result is still HEAD. See the README for
 review and undo instructions.
 
-The CLI requires Bash, `git`, `grep`, `awk`, `readlink`, and filesystem
-symlink support; it has no server, database, or package-runtime dependency.
+`bin/memory` is a launcher for a prebuilt Rust binary that it downloads and
+verifies on first run (set `AGENT_MEMORY_BIN` to use a locally built one). The
+CLI needs `git` and filesystem symlink support; it has no server, database, or
+package-runtime dependency.
 
 ## Reading
 
