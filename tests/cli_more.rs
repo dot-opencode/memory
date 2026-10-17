@@ -659,7 +659,8 @@ fn backup_push_without_remote_fails() {
 #[test]
 fn install_opencode_creates_plugin_symlink() {
     let t = T::new();
-    t.memory(&["install-opencode"]).ok();
+    let out = t.memory(&["install-opencode"]).ok();
+    out.assert_contains("opencode plugin add github:dot-opencode/memory#release");
     assert_link(
         t.home.join(".config/opencode/plugins/agent-memory.js"),
         plugin_target(&t),

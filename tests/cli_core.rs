@@ -54,6 +54,23 @@ fn integration_snippets_exist_and_agree() {
 }
 
 #[test]
+fn package_json_version_matches_cargo_toml() {
+    let t = T::new();
+    let cargo = cat(t.root.join("Cargo.toml"));
+    let cargo_version = cargo
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|v| v.split('"').next())
+        .unwrap_or_else(|| fail("no version in Cargo.toml"))
+        .to_string();
+    let pkg = cat(t.root.join("package.json"));
+    let needle = format!("\"version\": \"{cargo_version}\"");
+    if !pkg.contains(&needle) {
+        fail(&format!("package.json lacks {needle}"));
+    }
+}
+
+#[test]
 fn integration_cursor_body_detects_final_newline_drift() {
     let t = T::new();
     let s = t.tmp.join("snippet.md");

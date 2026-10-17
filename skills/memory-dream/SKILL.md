@@ -13,7 +13,7 @@ guessing.
 No `./.memory/` directory → this project has no memory. Stop; you may suggest
 `memory init <workspace>` to the user, but never run it yourself.
 
-Use `memory` from PATH, or the bundled `agent-memory/bin/memory`.
+Use `memory` from PATH, or the absolute path given in the `<agent-memory>` block (plugin install), or the bundled `agent-memory/bin/memory`.
 
 ## Procedure
 
