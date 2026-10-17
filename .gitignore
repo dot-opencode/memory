@@ -11,3 +11,6 @@ docs/research/
 
 # dependencies
 node_modules/
+
+# rust build output
+target/

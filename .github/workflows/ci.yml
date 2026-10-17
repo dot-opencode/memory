@@ -5,13 +5,36 @@ on:
   pull_request:
 
 jobs:
-  shellcheck:
+  rust:
+    name: cargo (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --release
+
+  launcher:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
-      - run: shellcheck --version
-      - run: shellcheck skills/agent-memory/bin/memory tests/run.sh
+      - run: shellcheck skills/agent-memory/bin/memory tests/launcher.sh
+      - run: bash tests/launcher.sh
+
+  # The launcher runs under stock macOS /bin/sh and bash 3.2.
+  launcher-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: /bin/bash tests/launcher.sh
 
   test-opencode-plugin:
     runs-on: ubuntu-latest
@@ -21,26 +44,3 @@ jobs:
         with:
           node-version: 22
       - run: npm run test:opencode
-
-  test-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash --version | head -1
-      - run: bash tests/run.sh
-
-  # Stock macOS ships bash 3.2 as /bin/bash; GitHub's image also has a newer
-  # bash on PATH. Put a shim first so `#!/usr/bin/env bash` resolves to 3.2.
-  test-macos-bash32:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Force bash 3.2 on PATH
-        run: |
-          mkdir -p "$RUNNER_TEMP/bash32"
-          ln -s /bin/bash "$RUNNER_TEMP/bash32/bash"
-          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
-      - run: |
-          bash --version | head -1
-          case "$(bash --version | head -1)" in *"version 3.2"*) ;; *) echo "expected bash 3.2 on PATH"; exit 1 ;; esac
-      - run: bash tests/run.sh

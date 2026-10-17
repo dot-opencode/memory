@@ -1,7 +1,7 @@
 # agent-memory
 
 A three-level, file-based memory system for coding agents. No servers or
-databases — markdown files, symlinks, and one Bash script.
+databases — markdown files, symlinks, and one small Rust binary.
 
 It is a **personal** memory: one developer's agents, across all of that
 developer's projects. The store lives in your home directory; "group" memory
@@ -38,6 +38,17 @@ on your `PATH`:
 
 ```bash
 ln -s ~/.agents/skills/agent-memory/bin/memory ~/.local/bin/memory
+```
+
+`bin/memory` is a small launcher. On first run it downloads the prebuilt
+binary pinned in `bin/release.txt` from GitHub Releases, checks its sha256 and
+caches it under `~/.cache/agent-memory/` (`$XDG_CACHE_HOME` if set). Prebuilt
+binaries exist for macOS (arm64, x86_64) and Linux (x86_64, aarch64). Offline
+or on another platform, build it yourself and point the launcher at it:
+
+```bash
+cargo install --git https://github.com/dot-opencode/memory agent-memory
+export AGENT_MEMORY_BIN="$HOME/.cargo/bin/memory"
 ```
 
 The installer creates only this symlink:
@@ -183,8 +194,10 @@ The snippets do not back up the store — run `memory backup` yourself.
 
 ## Dependencies
 
-The CLI uses Bash plus standard shell utilities (`grep`, `awk`, `readlink`),
-`git`, and filesystem symlink support. The OpenCode integration uses OpenCode's
+The CLI is a single static Rust binary. At runtime it calls `git`, `grep`
+(for `memory grep`), and, for `memory dream`, `opencode` and `sqlite3`; it needs
+filesystem symlink support. The launcher needs `curl` or `wget`, `tar`, and
+`shasum` or `sha256sum` for the first download. The OpenCode integration uses OpenCode's
 built-in Bun runtime and imports only Node built-ins; it has no package
 dependencies.
 
@@ -208,7 +221,7 @@ The agent protocol is defined in [`skills/agent-memory/SKILL.md`](skills/agent-m
 
 ## Limitations
 
-- **Windows** is not supported (symlinks, Bash).
+- **Windows** is not supported (symlinks).
 - **Containers / CI / remote dev**: `.memory/*` are absolute symlinks into the
   host store. Inside a container they resolve only if the store is mounted at
   the same absolute path. Sandboxed agents restricted to the workspace cannot
@@ -233,6 +246,14 @@ The agent protocol is defined in [`skills/agent-memory/SKILL.md`](skills/agent-m
 ## Tests
 
 ```bash
-bash tests/run.sh
+cargo test
+bash tests/launcher.sh
 npm run test:opencode
 ```
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, merge, then push a tag `v<version>`. The
+release workflow builds the four targets, publishes them to GitHub Releases
+and commits the new hashes to `skills/agent-memory/bin/release.txt`. The
+launcher only downloads what that file pins.
