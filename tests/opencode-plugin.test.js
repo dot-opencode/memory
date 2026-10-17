@@ -38,7 +38,9 @@ function deferredEvents() {
 }
 
 async function waitFor(check) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  // Poll by wall clock, not by a fixed number of ticks: slow CI runners need more turns.
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline) {
     if (check()) return
     await new Promise((resolve) => setImmediate(resolve))
   }

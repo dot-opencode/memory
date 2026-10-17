@@ -59,7 +59,9 @@ esac
 [ -n "$TARGET" ] || die "unsupported platform $OS/$ARCH; set AGENT_MEMORY_BIN to a memory binary or build one with: cargo install --git https://github.com/dot-opencode/memory"
 
 CACHE_ROOT=${XDG_CACHE_HOME:-${HOME:-}/.cache}
-[ -n "$CACHE_ROOT" ] && [ "$CACHE_ROOT" != "/.cache" ] || die "cannot determine cache directory (set HOME or XDG_CACHE_HOME)"
+if [ -z "$CACHE_ROOT" ] || [ "$CACHE_ROOT" = "/.cache" ]; then
+  die "cannot determine cache directory (set HOME or XDG_CACHE_HOME)"
+fi
 CACHE_DIR=$CACHE_ROOT/agent-memory/$VERSION/$TARGET
 BIN=$CACHE_DIR/memory
 
