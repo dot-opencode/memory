@@ -6,6 +6,8 @@ license: MIT
 
 # Agent Memory
 
+If `memory` is not on PATH (plugin install), use the absolute path given in the `<agent-memory>` block wherever this skill says `memory`.
+
 Long-term memory lives in `./.memory/` as plain markdown. Three levels:
 
 - `./.memory/project/` — this project only

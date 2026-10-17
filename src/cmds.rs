@@ -863,6 +863,9 @@ pub fn install_opencode(args: &[String]) -> i32 {
     if !args.is_empty() {
         die!("usage: memory install-opencode");
     }
+    eprintln!(
+        "memory: install-opencode is deprecated; prefer `opencode plugin add github:dot-opencode/memory#release`"
+    );
     let skill = match crate::skill_dir() {
         Some(s) => s,
         None => die!("cannot resolve CLI path"),

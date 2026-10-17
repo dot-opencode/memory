@@ -7,6 +7,10 @@ import { registerMemoryRuntime } from "./memory-core.js"
 
 const moduleDirectory = await realpath(dirname(fileURLToPath(import.meta.url)))
 const memoryCli = resolve(moduleDirectory, "../bin/memory")
+const bundledSkills = [
+  { id: "agent-memory", path: resolve(moduleDirectory, "../SKILL.md") },
+  { id: "memory-dream", path: resolve(moduleDirectory, "../../memory-dream/SKILL.md") },
+]
 
 // POSIX children get a private process group: never signal the host's group.
 // Windows lacks POSIX group signals; its safe fallback only terminates the child.
@@ -107,6 +111,6 @@ async function logError(entry) {
 export default {
   id: "agent-memory",
   setup(ctx) {
-    return registerMemoryRuntime(ctx, { memoryCli, runBackup: runCommand, logError })
+    return registerMemoryRuntime(ctx, { memoryCli, runBackup: runCommand, logError, skills: bundledSkills })
   },
 }

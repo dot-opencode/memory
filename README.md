@@ -23,11 +23,37 @@ Codex and other AGENTS.md readers, install the 20-line snippet from
 
 ## Install for OpenCode V2
 
-Install the skill, then install its native OpenCode V2 plugin once:
+Install it as an OpenCode package plugin:
+
+```bash
+opencode plugin add github:dot-opencode/memory#release
+```
+
+The `release` branch moves only after a GitHub Release (and its pinned
+checksums) is published, so you get updates on releases only. Check and update with:
+
+```bash
+opencode plugin check      # is there a newer release?
+opencode plugin update     # fetch it; then restart OpenCode
+```
+
+The plugin registers both bundled skills, `agent-memory` and `memory-dream`.
+If a skill with the same name is already installed (for example via
+`npx skills`), that one wins. It also tells the agent the absolute path of the
+`memory` CLI, so nothing needs to be on `PATH` for the agent.
+
+For your own shell, symlink the launcher. The package path changes on update,
+so use the path the plugin shows the agent, or link it from the cache:
+
+```bash
+ln -s <path-to-package>/skills/agent-memory/bin/memory ~/.local/bin/memory
+```
+
+### Alternative: `npx skills` (deprecated install-opencode)
 
 ```bash
 npx skills add dot-opencode/memory -g -a opencode
-~/.agents/skills/agent-memory/bin/memory install-opencode
+~/.agents/skills/agent-memory/bin/memory install-opencode   # deprecated
 ```
 
 `npx skills add` installs every skill in this repository: `agent-memory`
@@ -255,5 +281,7 @@ npm run test:opencode
 
 Bump `version` in `Cargo.toml`, merge, then push a tag `v<version>`. The
 release workflow builds the four targets, publishes them to GitHub Releases
-and commits the new hashes to `skills/agent-memory/bin/release.txt`. The
-launcher only downloads what that file pins.
+and commits the new hashes to `skills/agent-memory/bin/release.txt`, then moves the
+`release` branch to that commit. Keep `version` in `package.json` equal to
+`Cargo.toml` (a test and the workflow check this). The launcher only downloads
+what `release.txt` pins.

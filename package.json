@@ -1,7 +1,16 @@
 {
   "name": "agent-memory",
   "private": true,
+  "version": "0.1.0",
   "type": "module",
+  "exports": {
+    ".": "./skills/agent-memory/opencode/agent-memory.js"
+  },
+  "files": [
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22"
   },

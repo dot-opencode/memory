@@ -459,3 +459,82 @@ test("managed command tolerates an already-gone group and spawn errors", async (
   assert.equal(result.exitCode, 7)
   await assert.rejects(runCommand({ command: "/nonexistent-agent-memory-command", args: [], cwd: process.cwd() }), { code: "ENOENT" })
 })
+
+async function skillCtx(root, { existing = [], fail = false } = {}) {
+  const events = deferredEvents()
+  const ctx = contextFor(root, events, async () => ({ exitCode: 0, stdout: "", stderr: "" }), [])
+  const added = []
+  const reg = { disposed: 0 }
+  ctx.skill = {
+    transform: async (fn) => {
+      if (fail) throw new Error("boom")
+      fn({ get: (id) => (existing.includes(id) ? {} : undefined), add: (info) => void added.push(info) })
+      return { dispose: () => void (reg.disposed += 1) }
+    },
+  }
+  return { ctx, added, reg }
+}
+
+async function skillFiles() {
+  const dir = await mkdtemp(join(tmpdir(), "agent-memory-skills-"))
+  const a = join(dir, "a.md"); const b = join(dir, "b.md")
+  await writeFile(a, "---\nname: one\ndescription: Desc A\n---\n\n# A\nbody\n")
+  await writeFile(b, "---\nname: two\ndescription: Desc B\n---\n\n# B\nbody\n")
+  return [{ id: "one", path: a }, { id: "two", path: b }, { id: "gone", path: join(dir, "missing.md") }]
+}
+
+test("registers bundled skills via ctx.skill.transform and disposes them", async () => {
+  const root = await workspace()
+  const w = await skillCtx(root)
+  const skills = await skillFiles()
+  const stop = await registerMemoryRuntime(w.ctx, { memoryCli: "/tmp/memory", runBackup: w.ctx.runBackup, logError: w.ctx.logError, skills })
+  assert.deepEqual(w.added.map((s) => s.id), ["one", "two"])
+  assert.deepEqual(w.added[0], { id: "one", name: "one", description: "Desc A", path: skills[0].path, content: "# A\nbody" })
+  await stop()
+  assert.equal(w.reg.disposed, 1)
+})
+
+test("skips each bundled skill that already exists", async () => {
+  const root = await workspace()
+  const w = await skillCtx(root, { existing: ["one"] })
+  const stop = await registerMemoryRuntime(w.ctx, { memoryCli: "/tmp/memory", runBackup: w.ctx.runBackup, logError: w.ctx.logError, skills: await skillFiles() })
+  assert.deepEqual(w.added.map((s) => s.id), ["two"])
+  await stop()
+})
+
+test("skill registration failures never throw", async () => {
+  const root = await workspace()
+  const w = await skillCtx(root, { fail: true })
+  const stop = await registerMemoryRuntime(w.ctx, { memoryCli: "/tmp/memory", runBackup: w.ctx.runBackup, logError: w.ctx.logError, skills: await skillFiles() })
+  await stop()
+})
+
+test("real SKILL.md files register both skills with frontmatter stripped", async () => {
+  const root = await workspace()
+  const w = await skillCtx(root)
+  const base = new URL("../skills/", import.meta.url).pathname
+  const skills = [
+    { id: "agent-memory", path: join(base, "agent-memory/SKILL.md") },
+    { id: "memory-dream", path: join(base, "memory-dream/SKILL.md") },
+  ]
+  const stop = await registerMemoryRuntime(w.ctx, { memoryCli: "/tmp/memory", runBackup: w.ctx.runBackup, logError: w.ctx.logError, skills })
+  assert.deepEqual(w.added.map((s) => s.id), ["agent-memory", "memory-dream"])
+  for (const s of w.added) {
+    assert.ok(s.description.length > 10)
+    assert.ok(!s.content.startsWith("---"))
+  }
+  await stop()
+})
+
+test("injected block names the absolute CLI path and keeps the cap", async () => {
+  const root = await workspace()
+  await writeIndex(root, "project", "- [pool](pool.md) — gotcha: cap connections\n")
+  const block = await loadMemoryIndexes(root, "/abs/bin/memory")
+  assert.match(block, /not on PATH; run it as `\/abs\/bin\/memory`/)
+  assert.doesNotMatch(await loadMemoryIndexes(root), /not on PATH/)
+  const entries = Array.from({ length: 400 }, (_, i) => `- [f${i}](f${i}.md) — gotcha: ${"x".repeat(90)}`).join("\n")
+  await writeIndex(root, "project", entries)
+  const big = await loadMemoryIndexes(root, "/abs/bin/memory")
+  assert.ok(big.length <= 25600)
+  assert.match(big, /indexes truncated/)
+})
