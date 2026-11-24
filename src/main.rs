@@ -11,7 +11,7 @@ mod schedule;
 
 use ctx::*;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 
 const USAGE: &str = "usage: memory <command> [args]        (memory --version prints the version)
 
@@ -24,7 +24,7 @@ commands:
   grep <pattern> [grep opts]                search all linked levels (follows the symlinks)
   doctor                                    check symlinks, indexes, frontmatter
   dream --report [--stale-days N] [--workspace <ws>]  read-only whole-store report: duplicates, stale facts
-  dream [--workspace <ws>] [--model <m>] [--if-changed] [--full] [--web] [--timeout <min>] [--print-config]
+  dream [--workspace <ws>] [--model <m>] [--allow-plugin <name>]... [--if-changed] [--full] [--web] [--timeout <min>] [--print-config]
                                              tidy the store with a sandboxed OpenCode run
   schedule install [--at HH:MM] [--model <provider/model>]
   schedule uninstall | status                manage the nightly dream job

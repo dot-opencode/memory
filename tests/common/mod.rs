@@ -13,7 +13,7 @@
 //!   env set explicitly: `AGENT_MEMORY_HOME`, `HOME`, `PWD` (= cwd, like a
 //!   shell's `cd`), `AGENT_MEMORY_BACKUP_LOCK_WAIT=0`, `GIT_CONFIG_NOSYSTEM=1`,
 //!   `AGENT_MEMORY_SKILL_DIR`, `AGENT_MEMORY_SELF`, `MEMORY_BIN`; and
-//!   `XDG_CONFIG_HOME`, `AGENT_MEMORY_DREAM_MODEL`, `AGENT_MEMORY_TODAY`,
+//!   `XDG_CONFIG_HOME`, `AGENT_MEMORY_DREAM_MODEL`, `AGENT_MEMORY_DREAM_PLUGINS`, `AGENT_MEMORY_TODAY`,
 //!   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` are removed. `PATH` is the real
 //!   PATH with `t.path_dirs` prepended.
 //! * Persistent per-test env (the Bash `export`): `t.set_env(k, v)`,
@@ -469,6 +469,7 @@ impl T {
         for k in [
             "XDG_CONFIG_HOME",
             "AGENT_MEMORY_DREAM_MODEL",
+            "AGENT_MEMORY_DREAM_PLUGINS",
             "AGENT_MEMORY_TODAY",
             "GIT_DIR",
             "GIT_WORK_TREE",
@@ -733,7 +734,14 @@ for spec in $STUB_TOOLS; do
   else
     part="{\"type\":\"tool\",\"name\":\"shell\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"$cmd\"},\"error\":{\"type\":\"permission.rejected\",\"message\":\"Permission denied: shell\"}}}"
   fi
-  sqlite3 "$OPENCODE_DB" "insert into session_message values ('m$seq','s','assistant',$seq,0,0,'{\"content\":[$part]}');"
+  if [ -n "${STUB_PARTS:-}" ]; then
+    # OpenCode 2.4+: tool calls live in session_part, the message content is empty.
+    sqlite3 "$OPENCODE_DB" "create table if not exists session_part (message_id text, session_id text, ordinal integer, type text, call_id text, time_created integer, time_updated integer, data text);"
+    sqlite3 "$OPENCODE_DB" "insert into session_message values ('m$seq','s','assistant',$seq,0,0,'{\"content\":[]}');"
+    sqlite3 "$OPENCODE_DB" "insert into session_part values ('m$seq','s',0,'tool',null,0,0,'$part');"
+  else
+    sqlite3 "$OPENCODE_DB" "insert into session_message values ('m$seq','s','assistant',$seq,0,0,'{\"content\":[$part]}');"
+  fi
 done
 exit 0
 "#;

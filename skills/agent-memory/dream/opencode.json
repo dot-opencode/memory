@@ -178,6 +178,7 @@
     {"action": "tool.use", "resource": "external_directory:*/..", "effect": "deny"},
     {"action": "integration.use", "resource": "mcp:*", "effect": "deny"},
     {"action": "integration.use", "resource": "plugin:*", "effect": "deny"}
+    ,{"action": "integration.use", "resource": "plugin:*__PLUGIN_ALLOW__*", "effect": "allow"}
   ],
   "agents": {
     "memory-dream": {

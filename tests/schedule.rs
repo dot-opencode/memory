@@ -62,6 +62,7 @@ fn systemd_install_and_status() {
     .env("AGENT_MEMORY_HOME", "relative store%")
     .env("AGENT_MEMORY_BIN", "binary with \"quotes\" and \\slashes\\")
     .env("AGENT_MEMORY_DREAM_MODEL", "env/model")
+    .env("AGENT_MEMORY_DREAM_PLUGINS", "provider,another-plugin")
     .env("AGENT_MEMORY_DREAM_TIMEOUT", "12")
     .ok()
     .assert_contains("Time: 23:59")
@@ -98,6 +99,10 @@ fn systemd_install_and_status() {
     assert_contains(&service, "Environment=\"AGENT_MEMORY_DREAM_TIMEOUT=12\"");
     assert_contains(
         &service,
+        "Environment=\"AGENT_MEMORY_DREAM_PLUGINS=provider,another-plugin\"",
+    );
+    assert_contains(
+        &service,
         r#"/.cache/launcher 100%%/memory" "dream" "--if-changed" "--model" "test/model""#,
     );
     assert_eq_str(cat(&log), "systemctl --user daemon-reload\nsystemctl --user enable --now agent-memory-dream.timer\nloginctl show-user schedule-test -p Linger");
@@ -125,6 +130,7 @@ fn systemd_install_and_status() {
     let service = cat(units.join(SERVICE));
     assert_not_contains(&service, "--model");
     assert_not_contains(&service, "AGENT_MEMORY_BIN=");
+    assert_not_contains(&service, "AGENT_MEMORY_DREAM_PLUGINS=");
 }
 
 #[test]
@@ -179,6 +185,7 @@ fn launchd_install_status_and_uninstall() {
     let job_log = t.home.join("Library/Logs/agent-memory-dream.log");
     t.memory(&["schedule", "install", "--at", "08:07"])
         .env("AGENT_MEMORY_SELF", &cli)
+        .env("AGENT_MEMORY_DREAM_PLUGINS", "provider,another-plugin")
         .ok()
         .assert_contains(&plist.display().to_string())
         .assert_contains("Time: 08:07");
@@ -194,6 +201,10 @@ fn launchd_install_status_and_uninstall() {
         "<string>dream</string>\n<string>--if-changed</string>",
     );
     assert_contains(&text, "<key>EnvironmentVariables</key><dict>");
+    assert_contains(
+        &text,
+        "<key>AGENT_MEMORY_DREAM_PLUGINS</key><string>provider,another-plugin</string>",
+    );
     assert_contains(
         &text,
         format!(

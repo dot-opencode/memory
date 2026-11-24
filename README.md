@@ -141,6 +141,10 @@ shared details and identify facts to remove.
   Without `--model` it uses `AGENT_MEMORY_DREAM_MODEL`, or OpenCode's default
   model. The consolidation is judgment work, so a strong model is worth it: in
   testing, a small model read 35 of 500 facts and changed only descriptions.
+  If the model needs a provider plugin, use `--allow-plugin <name>` (repeatable),
+  for example `--allow-plugin opencode-proxy-provider`. The flag adds to the
+  comma-separated names in `AGENT_MEMORY_DREAM_PLUGINS`. Names match substrings
+  of the configured plugin spec.
 - The local `memory-dream` skill works interactively on the current project's
   memory. Unlike the unattended CLI run, it may delete or move facts after
   asking for approval.
@@ -155,11 +159,12 @@ requiring Git history remain unresolved for manual review. History and content
 commands are disabled because they bypass file-read restrictions.
 Grep and glob tools are disabled because their permission
 resources are search expressions rather than paths. Git add/mv/rm are disabled
-because wildcard permissions cannot safely constrain their arguments. MCP and
-plugin integrations are denied by policy. These restrictions cannot guarantee
-confidentiality from the model or its provider. Do not run it on data you are not
-willing to send to that provider.
-The rules were verified with live runs on OpenCode v2.0.31; enforcement may
+because wildcard permissions cannot safely constrain their arguments. MCP is
+always denied; plugins are denied unless explicitly allowed. An allowed plugin
+runs with full plugin privileges inside the run, so only allow plugins you trust.
+These restrictions cannot guarantee confidentiality from the model or its
+provider. Do not run it on data you are not willing to send to that provider.
+The rules were verified with live runs on OpenCode v2.0.31 and v2.4.1; enforcement may
 differ in other versions.
 
 The permission matcher cannot express everything, so the CLI adds its own
@@ -221,10 +226,11 @@ remove it.
 
 The job records the CLI path, the resolved `AGENT_MEMORY_HOME`, and any nonempty
 `PATH`, `AGENT_MEMORY_BIN`, `AGENT_MEMORY_SKILL_DIR`, `AGENT_MEMORY_DREAM_MODEL`,
-and `AGENT_MEMORY_DREAM_TIMEOUT` settings from installation. Re-run
-`memory schedule install` if the CLI path changes, for example after a plugin
-update. Read logs with `journalctl --user -u agent-memory-dream` on Linux or in
-`~/Library/Logs/agent-memory-dream.log` on macOS.
+`AGENT_MEMORY_DREAM_PLUGINS`, and `AGENT_MEMORY_DREAM_TIMEOUT` settings from
+installation. Re-run `memory schedule install` if the CLI path changes, for
+example after a plugin update. On Linux, read logs with
+`journalctl --user -u agent-memory-dream`. On macOS, read
+`~/Library/Logs/agent-memory-dream.log`.
 
 ## Other agents
 

@@ -779,6 +779,69 @@ fn dream_print_config_is_valid_json() {
 }
 
 #[test]
+fn dream_print_config_allows_selected_plugins_after_deny() {
+    let mut t = T::new();
+    t.dream_fixture();
+    let out = t
+        .memory(&[
+            "dream",
+            "--print-config",
+            "--allow-plugin",
+            "another-plugin",
+            "--allow-plugin",
+            "__STORE__",
+        ])
+        .env(
+            "AGENT_MEMORY_DREAM_PLUGINS",
+            "opencode-proxy-provider,github:org/plugin@1.2#release",
+        )
+        .ok();
+    let (json, _) = out.stdout.split_once("\n---\n").unwrap();
+    assert_contains(json, r#""resource": "mcp:*", "effect": "deny""#);
+    let mut rules = json
+        .split_once(r#""resource": "plugin:*", "effect": "deny""#)
+        .unwrap()
+        .1;
+    for name in [
+        "opencode-proxy-provider",
+        "github:org/plugin@1.2#release",
+        "another-plugin",
+        "__STORE__",
+    ] {
+        rules = rules
+            .split_once(&format!(
+                r#""resource": "plugin:*{name}*", "effect": "allow""#
+            ))
+            .unwrap()
+            .1;
+    }
+    if Command::new("node").arg("--version").output().is_ok() {
+        t.cmd(
+            "node",
+            &["-e", r#"JSON.parse(require("fs").readFileSync(0, "utf8"))"#],
+        )
+        .stdin(json.as_bytes())
+        .ok();
+    }
+}
+
+#[test]
+fn dream_rejects_invalid_plugin_names() {
+    let t = T::new();
+    for name in ["", "a*b", "a?b", "a[b]", "a\"b", "a b", "café"] {
+        t.memory(&["dream", "--print-config", "--allow-plugin", name])
+            .code(1)
+            .assert_contains("invalid dream plugin name");
+    }
+    for names in ["good,,other", "good, bad", "good,other*"] {
+        t.memory(&["dream", "--print-config"])
+            .env("AGENT_MEMORY_DREAM_PLUGINS", names)
+            .code(1)
+            .assert_contains("invalid dream plugin name");
+    }
+}
+
+#[test]
 fn dream_rejects_json_unsafe_home() {
     let mut t = T::new();
     t.dream_fixture();

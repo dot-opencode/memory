@@ -115,6 +115,7 @@ fn install(backend: Backend, time: &str, model: Option<&str>) {
         "AGENT_MEMORY_BIN",
         "AGENT_MEMORY_SKILL_DIR",
         "AGENT_MEMORY_DREAM_MODEL",
+        "AGENT_MEMORY_DREAM_PLUGINS",
         "AGENT_MEMORY_DREAM_TIMEOUT",
     ]
     .into_iter()

@@ -88,14 +88,27 @@ fn render_line(line: &str, dir: &str, store: &str, bin: &str, home: &str) -> Str
     out
 }
 
-fn render(tpl: &str, store: &str, bin: &str, home: &str, dirs: &[String], web: bool) -> String {
+fn render(
+    tpl: &str,
+    store: &str,
+    bin: &str,
+    home: &str,
+    dirs: &[String],
+    web: bool,
+    plugins: &[&str],
+) -> String {
     let mut out = String::new();
     let body = format!("{tpl}\n");
     for line in body.strip_suffix('\n').unwrap_or(&body).split('\n') {
         if line.contains("__WEB_ONLY__") && !web {
             continue;
         }
-        if line.contains("__PROJECT_DIR__") {
+        if line.contains("__PLUGIN_ALLOW__") {
+            for plugin in plugins {
+                out.push_str(&line.replace("__PLUGIN_ALLOW__", plugin));
+                out.push('\n');
+            }
+        } else if line.contains("__PROJECT_DIR__") {
             for d in dirs.iter().filter(|d| !d.is_empty()) {
                 out.push_str(&render_line(line, d, store, bin, home));
                 out.push('\n');
@@ -106,6 +119,17 @@ fn render(tpl: &str, store: &str, bin: &str, home: &str, dirs: &[String], web: b
         }
     }
     out.trim_end_matches('\n').to_string()
+}
+
+fn plugin_name(name: &str) -> &str {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._@/#:-".contains(&b))
+    {
+        die!("invalid dream plugin name {name:?}: use one or more of A-Z, a-z, 0-9, or ._@/#:-");
+    }
+    name
 }
 
 fn is_md_fact(p: &str) -> bool {
@@ -283,23 +307,45 @@ fn sandbox_check(db: &str) -> i32 {
         return 2;
     }
     let sql = "
-    WITH t AS (
-      SELECT m.seq AS seq, j.key AS k,
-             json_extract(j.value, '$.name') AS name,
-             json_extract(j.value, '$.state.status') AS status,
-             json_extract(j.value, '$.state.input.command') AS cmd,
-             (coalesce(json_extract(j.value, '$.state.error.type'), '') = 'permission.rejected'
-              OR coalesce(json_extract(j.value, '$.state.error.message'), '') LIKE 'Permission denied%') AS denied
+    WITH p AS (
+      -- OpenCode < 2.4 kept tool calls inside the message; 2.4+ stores them in session_part.
+      SELECT m.seq AS seq, j.key AS k, j.value AS v
       FROM session_message m, json_each(json_extract(m.data, '$.content')) j
-      WHERE m.type = 'assistant' AND json_extract(j.value, '$.type') = 'tool')
+      WHERE m.type = 'assistant' AND json_extract(j.value, '$.type') = 'tool'
+      __PARTS__),
+    t AS (
+      SELECT seq, k,
+             json_extract(v, '$.name') AS name,
+             json_extract(v, '$.state.status') AS status,
+             json_extract(v, '$.state.input.command') AS cmd,
+             (coalesce(json_extract(v, '$.state.error.type'), '') = 'permission.rejected'
+              OR coalesce(json_extract(v, '$.state.error.message'), '') LIKE 'Permission denied%') AS denied
+      FROM p)
     SELECT (SELECT count(*) FROM t WHERE status = 'completed'),
            (SELECT count(*) FROM t WHERE denied = 1),
            coalesce((SELECT status || ':' || denied FROM t
                      WHERE name = 'shell' AND cmd LIKE '%dream --report%'
                      ORDER BY seq, k LIMIT 1), '');
   ";
+    let mut probe = Command::new("sqlite3");
+    probe.args([
+        "-readonly",
+        db,
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_part'",
+    ]);
+    let parts = match capture(&mut probe, false) {
+        (0, o) if o.trim() == "1" => {
+            "UNION ALL
+      SELECT m.seq, s.ordinal, s.data
+      FROM session_part s JOIN session_message m ON m.id = s.message_id
+      WHERE s.type = 'tool'"
+        }
+        (0, _) => "",
+        _ => return 2,
+    };
+    let sql = sql.replace("__PARTS__", parts);
     let mut c = Command::new("sqlite3");
-    c.args(["-readonly", "-separator", "|", db, sql]);
+    c.args(["-readonly", "-separator", "|", db, &sql]);
     let (rc, out) = capture(&mut c, false);
     if rc != 0 {
         return 2;
@@ -366,7 +412,7 @@ fn find_symlinks(dir: &str, out: &mut Vec<String>) {
 }
 
 pub fn dream(args: &[String]) -> i32 {
-    let usage = "usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--if-changed] [--full] [--web] [--timeout <minutes>] [--print-config]";
+    let usage = "usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--allow-plugin <name>]... [--if-changed] [--full] [--web] [--timeout <minutes>] [--print-config]";
     let mut report = false;
     let mut stale_days: Option<i64> = None;
     let mut workspace = String::new();
@@ -378,6 +424,7 @@ pub fn dream(args: &[String]) -> i32 {
         timeout_min = "120".into();
     }
     let mut timeout_flag = false;
+    let mut plugin_flags = Vec::new();
     let n = args.len();
     let mut i = 0;
     while i < n {
@@ -442,11 +489,23 @@ pub fn dream(args: &[String]) -> i32 {
                 model_flag = true;
                 i += 2;
             }
+            "--allow-plugin" => {
+                let name = args.get(i + 1).unwrap_or_else(|| die!("{usage}"));
+                plugin_flags.push(plugin_name(name));
+                i += 2;
+            }
             _ => die!("{usage}"),
         }
     }
     if report {
-        if model_flag || print_config || if_changed || full || web || timeout_flag {
+        if model_flag
+            || print_config
+            || if_changed
+            || full
+            || web
+            || timeout_flag
+            || !plugin_flags.is_empty()
+        {
             die!("{usage}");
         }
     } else if stale_days.is_some() {
@@ -460,6 +519,20 @@ pub fn dream(args: &[String]) -> i32 {
     if timeout_min_n == 0 {
         die!("{usage}");
     }
+    let plugins_env = if report {
+        String::new()
+    } else {
+        match std::env::var("AGENT_MEMORY_DREAM_PLUGINS") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(e) => die!("invalid AGENT_MEMORY_DREAM_PLUGINS: {e}"),
+        }
+    };
+    let mut plugins = Vec::new();
+    if !plugins_env.is_empty() {
+        plugins.extend(plugins_env.split(',').map(plugin_name));
+    }
+    plugins.extend(plugin_flags);
 
     let mh = memory_home();
     if !is_dir(&mh) {
@@ -512,8 +585,8 @@ pub fn dream(args: &[String]) -> i32 {
     let dirs = project_dirs(&workspace);
     let config_t = read_trim(&format!("{assets}/opencode.json"));
     let prompt_t = read_trim(&format!("{assets}/prompt.md"));
-    let config = render(&config_t, &store, &script, &home, &dirs, web);
-    let mut prompt = render(&prompt_t, &store, &script, &home, &dirs, web);
+    let config = render(&config_t, &store, &script, &home, &dirs, web, &plugins);
+    let mut prompt = render(&prompt_t, &store, &script, &home, &dirs, web, &[]);
     if !workspace.is_empty() {
         prompt.push_str(&format!("\n\nWorkspace scope: {workspace}"));
     }

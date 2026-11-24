@@ -1220,6 +1220,27 @@ fn dream_other_denials_are_reported_but_not_fatal() {
 }
 
 #[test]
+fn dream_reads_tool_calls_from_session_part() {
+    let mut t = T::new();
+    if !t.dream_db_fixture() {
+        return;
+    }
+    let out = t
+        .memory(&["dream"])
+        .env("STUB_PARTS", "1")
+        .env("STUB_TOOLS", "/x/memory+dream+--report+now=ok probe=denied")
+        .run();
+    assert_contains(
+        out.combined(),
+        "1 tool call(s) were denied by the sandbox (1 succeeded)",
+    );
+    assert_eq_str(
+        t.git(&["rev-parse", "refs/memory-dream/last"]).ok().so(),
+        head(&t),
+    );
+}
+
+#[test]
 fn dream_unreadable_session_db_warns_and_still_succeeds() {
     let mut t = T::new();
     t.dream_launch_fixture(); // default stub writes no database

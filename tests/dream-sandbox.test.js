@@ -13,8 +13,9 @@ const PROJECTS = ["/Users/u/work/app", "/Users/u/work/other"];
 const template = readFileSync(new URL("../skills/agent-memory/dream/opencode.json", import.meta.url), "utf8");
 const schema = JSON.parse(readFileSync(new URL("./fixtures/opencode-config.schema.json", import.meta.url), "utf8"));
 
-function expand(web = false, projects = PROJECTS) {
+function expand(web = false, projects = PROJECTS, plugins = []) {
   return JSON.parse(template.split("\n").flatMap(line => {
+    if (line.includes("__PLUGIN_ALLOW__")) return plugins.map(p => line.replaceAll("__PLUGIN_ALLOW__", p));
     if (line.includes("__WEB_ONLY__")) return web ? [line.replaceAll("__WEB_ONLY__", "")] : [];
     if (line.includes("__PROJECT_DIR__")) return projects.map(p => line.replaceAll("__PROJECT_DIR__", p));
     return [line];
@@ -58,7 +59,7 @@ function validate(c) {
   }
 }
 
-test("official policy schema, both optional-line contracts and JSON validity", () => {
+test("official policy schema, optional-line contracts and JSON validity", () => {
   validate(JSON.parse(template));
   for (const web of [false, true]) for (const dirs of [[], PROJECTS]) {
     const c = expand(web, dirs);
@@ -75,6 +76,15 @@ test("official policy schema, both optional-line contracts and JSON validity", (
   const broken = structuredClone(config);
   broken.policies[0].action = "permission";
   assert.throws(() => validate(broken));
+});
+
+test("plugin allow rules override only matching plugins, not MCP", () => {
+  const c = expand(false, PROJECTS, ["opencode-proxy-provider"]);
+  validate(c);
+  const allowed = resource => decide(c.policies, "integration.use", resource);
+  assert.ok(allowed("plugin:github:dot-opencode/opencode-proxy-provider#release"));
+  assert.ok(!allowed("plugin:unrelated"));
+  assert.ok(!allowed("mcp:opencode-proxy-provider"));
 });
 
 test("case-sensitive matcher; no legacy rtk or unrestricted git rules", () => {
