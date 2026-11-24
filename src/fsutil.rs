@@ -161,6 +161,17 @@ pub fn valid_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// Name of an existing project or group directory. Stores created before slug
+/// validation hold names like `Ianus` or `fix_audio`; they stay readable and
+/// editable. New names still go through `require_slug`.
+pub fn valid_level_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b[0].is_ascii_alphanumeric()
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
 pub fn require_slug(kind: &str, v: &str) {
     if !valid_slug(v) {
         crate::die!("invalid {kind} '{v}': use lowercase letters, digits, and hyphens");

@@ -26,7 +26,7 @@ pub fn collect_levels(only: &str) -> Vec<(String, String)> {
         cands.extend(glob_subdirs(&format!("{ws}/groups")));
         cands.extend(glob_subdirs(&format!("{ws}/projects")));
         for d in cands {
-            if !is_dir(&d) || !valid_slug(&basename(&d)) {
+            if !is_dir(&d) || !valid_level_name(&basename(&d)) {
                 continue;
             }
             let canon = match canon_dir(&d) {

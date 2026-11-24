@@ -1312,6 +1312,43 @@ fn dream_new_group_directory_is_a_failed_review() {
 }
 
 #[test]
+fn dream_edit_in_existing_legacy_named_project_is_allowed() {
+    let mut t = T::new();
+    t.dream_launch_fixture();
+    // A project directory from before slug validation (uppercase, underscore).
+    let legacy = t.store.join("work/projects/Legacy_Api");
+    fs::create_dir_all(&legacy).unwrap();
+    t.write(
+        legacy.join("old-fact.md"),
+        "---\ndescription: old\ntype: decision\ncreated: 2026-09-04\n---\nold\n",
+    );
+    t.memory(&["backup"]).ok();
+    t.install_acting_stub();
+    let out = t
+        .memory(&["dream"])
+        .env(
+            "STUB_ACT",
+            format!("printf -- '{FACT_BODY}' > work/projects/Legacy_Api/old-fact.md"),
+        )
+        .run();
+    out.assert_not_contains("unexpected paths");
+    out.assert_not_contains("run not counted");
+}
+
+#[test]
+fn dream_new_legacy_named_project_directory_is_a_failed_review() {
+    let mut t = T::new();
+    t.dream_launch_fixture();
+    t.install_acting_stub();
+    t.assert_escape_is_failed_review(
+        &format!(
+            "mkdir work/projects/New_Dir && printf -- '{FACT_BODY}' > work/projects/New_Dir/x.md"
+        ),
+        "work/projects/New_Dir/x.md",
+    );
+}
+
+#[test]
 fn dream_nested_hidden_and_non_markdown_files_are_failed_reviews() {
     let mut t = T::new();
     t.dream_launch_fixture();

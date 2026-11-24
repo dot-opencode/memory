@@ -171,7 +171,10 @@ The permission matcher cannot express everything, so the CLI adds its own
 checks. It refuses to run if the store contains symlinks outside `.git`. After
 the run, any change other than a `<slug>.md` fact in a level directory that
 already existed (a new project or group directory, a nested, hidden or
-non-Markdown file, a delete or rename) fails the run as a review commit. If
+non-Markdown file, a delete or rename) fails the run as a review commit.
+Project and group directories created before name validation (for example
+`Ianus` or `fix_audio`) count as existing levels; new ones must be lowercase
+slugs. If
 `sqlite3` is available, it reads the run's session database and fails the run
 when no tool call succeeded or `memory dream --report` was denied, so a broken
 sandbox is not counted as a quiet night; without `sqlite3` it only warns.

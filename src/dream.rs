@@ -218,7 +218,7 @@ fn unexpected_paths() -> String {
             if parts.len() == 4
                 && (parts[1] == "projects" || parts[1] == "groups")
                 && slug_ok(parts[0])
-                && slug_ok(parts[2])
+                && valid_level_name(parts[2])
                 && fact_ok(parts[3])
             {
                 level = format!("{}/{}/{}", parts[0], parts[1], parts[2]);
