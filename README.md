@@ -130,8 +130,7 @@ shared details and identify facts to remove.
   or rename the old file: it reports paths for manual deletion instead. The CLI
   rebuilds indexes afterwards.
   `--print-config` shows the exact config and prompt without running anything.
-  `--if-changed` skips the run when no fact changed since
-  the last successful run, for use from a nightly scheduler (launchd, cron).
+  `--if-changed` skips the run when no fact changed since the last successful run.
   After the first successful run, later runs are incremental: the agent gets
   the list of facts added or changed since the last run and checks only those
   against the rest (more than 150 changed facts means a full run). `--full`
@@ -211,6 +210,21 @@ git -C ~/.agent-memory revert HEAD
 Otherwise revert the result's commit hash instead of `HEAD`. This leaves the
 separate pre-run backup intact; reverting does not reset the last-successful-run
 ref. Use `memory dream --full` if the next run should reconsider all facts.
+
+### Nightly run
+
+Run `memory schedule install [--at HH:MM] [--model <provider/model>]` to run
+`memory dream --if-changed` nightly at 05:30 local time by default. This creates
+a systemd user service and timer on Linux or a LaunchAgent on macOS. Use
+`memory schedule status` to inspect the job and `memory schedule uninstall` to
+remove it.
+
+The job records the CLI path, the resolved `AGENT_MEMORY_HOME`, and any nonempty
+`PATH`, `AGENT_MEMORY_BIN`, `AGENT_MEMORY_SKILL_DIR`, `AGENT_MEMORY_DREAM_MODEL`,
+and `AGENT_MEMORY_DREAM_TIMEOUT` settings from installation. Re-run
+`memory schedule install` if the CLI path changes, for example after a plugin
+update. Read logs with `journalctl --user -u agent-memory-dream` on Linux or in
+`~/Library/Logs/agent-memory-dream.log` on macOS.
 
 ## Other agents
 

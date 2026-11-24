@@ -7,10 +7,11 @@ mod dream;
 mod facts;
 mod fsutil;
 mod report;
+mod schedule;
 
 use ctx::*;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 const USAGE: &str = "usage: memory <command> [args]        (memory --version prints the version)
 
@@ -24,7 +25,9 @@ commands:
   doctor                                    check symlinks, indexes, frontmatter
   dream --report [--stale-days N] [--workspace <ws>]  read-only whole-store report: duplicates, stale facts
   dream [--workspace <ws>] [--model <m>] [--if-changed] [--full] [--web] [--timeout <min>] [--print-config]
-                                            tidy the store with a sandboxed OpenCode run
+                                             tidy the store with a sandboxed OpenCode run
+  schedule install [--at HH:MM] [--model <provider/model>]
+  schedule uninstall | status                manage the nightly dream job
   backup [--push]                           commit (and push) the store
   install-opencode                          install the global OpenCode plugin";
 
@@ -83,6 +86,7 @@ fn main() {
         "grep" => cmds::grep(rest),
         "doctor" => cmds::doctor(rest),
         "dream" => dream::dream(rest),
+        "schedule" => schedule::schedule(rest),
         "backup" => backup::backup(rest),
         "install-opencode" => cmds::install_opencode(rest),
         "-v" | "--version" => {
