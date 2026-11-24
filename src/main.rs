@@ -11,7 +11,7 @@ mod schedule;
 
 use ctx::*;
 
-const VERSION: &str = "0.2.1";
+const VERSION: &str = "0.2.2";
 
 const USAGE: &str = "usage: memory <command> [args]        (memory --version prints the version)
 

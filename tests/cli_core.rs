@@ -127,8 +127,8 @@ fn unknown_command() {
 #[test]
 fn version_flag() {
     let t = T::new();
-    assert_eq_str(t.memory(&["--version"]).ok().so(), "memory 0.2.1");
-    assert_eq_str(t.memory(&["-v"]).ok().so(), "memory 0.2.1");
+    assert_eq_str(t.memory(&["--version"]).ok().so(), "memory 0.2.2");
+    assert_eq_str(t.memory(&["-v"]).ok().so(), "memory 0.2.2");
     t.memory(&["--version", "extra"])
         .run()
         .code(1)
